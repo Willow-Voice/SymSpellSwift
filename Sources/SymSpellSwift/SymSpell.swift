@@ -17,10 +17,10 @@ public class SymSpell {
     }
     
     public struct Segmentation {
-        var segmentedString = ""
-        var correctedString = ""
-        var distanceSum = 0
-        var probabilityLogSum = 0.0
+        public var segmentedString = ""
+        public var correctedString = ""
+        public var distanceSum = 0
+        public var probabilityLogSum = 0.0
     }
     
     public var wordCount: Int { words.count }
