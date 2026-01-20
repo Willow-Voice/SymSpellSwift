@@ -103,16 +103,173 @@ SymSpell.WordSegmentation has a linear runtime O(n) to find the optimum composit
 ## Swift implementation
 Current implementation builds on the original SymSpell, but uses Swift best practices and modern paradigms to achieve the same results with even better performance.
 
+This package includes two implementations:
+- **SymSpell** - Standard in-memory implementation (~150MB RAM for 82k words)
+- **LowMemorySymSpell** - Memory-mapped implementation (~15-20MB RAM) ideal for iOS keyboard extensions
+
 ## Usage
+
+### Standard SymSpell (In-Memory)
 
 ```swift
 let symSpell = SymSpell(maxDictionaryEditDistance: 2, prefixLength: 3)
 if let path = Bundle.main.url(forResource: "frequency_dictionary_en_82_765", withExtension: "txt") {
-  try? symSpell.loadDictionary(from: path, termIndex: 0, countIndex: 1, termCount: 82765)
+  try? await symSpell.loadDictionary(from: path, termIndex: 0, countIndex: 1, termCount: 82765)
 }
 
-let results = symSpell.lookup("intermedaite")
-
-print(results.first?.term)
+let results = symSpell.lookup("intermedaite", verbosity: .closest)
+print(results.first?.term)  // "intermediate"
 ```
+
+### LowMemorySymSpell (Memory-Mapped)
+
+For memory-constrained environments like iOS keyboard extensions (50MB limit):
+
+```swift
+let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7)
+
+// Load pre-built binary files from app bundle
+if let dataDir = Bundle.main.resourceURL?.appendingPathComponent("mmap_data") {
+    spellChecker.loadPrebuilt(from: dataDir)
+}
+
+// Spell checking
+let suggestions = spellChecker.lookup(phrase: "helo", verbosity: .top)
+print(suggestions.first?.term)  // "hello"
+
+// Auto-correction with confidence threshold
+if let correction = spellChecker.autoCorrection(for: "memebers") {
+    print(correction)  // "members"
+}
+
+// Word segmentation
+let result = spellChecker.wordSegmentation(phrase: "thequickbrown")
+print(result.correctedString)  // "the quick brown"
+```
+
+## Pre-built Dictionary Data
+
+This repository includes pre-built binary dictionary files in three sizes:
+
+| Directory | Words | Size | Use Case |
+|-----------|-------|------|----------|
+| `mmap_data_full` | ~83k | 24 MB | Full English dictionary |
+| `mmap_data` | ~83k | 24 MB | Default (same as full) |
+| `mmap_data_small` | ~30k | 13 MB | Smaller footprint |
+
+## Generating mmap Data Files
+
+To regenerate the binary dictionary files or create custom ones:
+
+### Prerequisites
+
+```bash
+# Create a virtual environment (recommended)
+cd symspellswift
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install symspellpy editdistpy
+```
+
+### Generate Files
+
+```bash
+# Full dictionary (default)
+python scripts/build_mmap_files.py --output ./mmap_data_full
+
+# Smaller dictionary (top 30k most frequent words)
+python scripts/build_mmap_files.py --output ./mmap_data_small --top-n 30000
+
+# Custom dictionary
+python scripts/build_mmap_files.py \
+    --dictionary /path/to/your/dictionary.txt \
+    --bigrams /path/to/your/bigrams.txt \
+    --output ./my_mmap_data
+
+# Deactivate venv when done
+deactivate
+```
+
+### Options
+
+```
+--output, -o       Output directory for binary files (default: ./mmap_data)
+--dictionary, -d   Path to frequency dictionary file
+--bigrams, -b      Path to bigram dictionary file
+--max-edit-distance, -e   Max edit distance (default: 2)
+--prefix-length, -p       Prefix length (default: 7)
+--top-n            Only include top N most frequent words
+```
+
+### Dictionary File Format
+
+**Word frequency dictionary** (tab or space separated):
+```
+the 23135851162
+of 13151942776
+and 12997637966
+```
+
+**Bigram dictionary**:
+```
+the the 34563
+of the 29432
+in the 23567
+```
+
+## Interactive TUI
+
+A terminal UI is included for testing the spell checker:
+
+```bash
+# Build and run
+swift run TUI
+
+# Or with explicit dictionary path
+swift run TUI --prebuilt ./mmap_data_full
+```
+
+**Controls:**
+- `Ctrl+A` - Toggle auto-replace (>=75% confidence)
+- `Ctrl+Z` - Undo last auto-replace
+- `Ctrl+V` - Cycle verbosity (TOP / CLOSEST / ALL)
+- `Ctrl+E` - Cycle max edit distance (1 / 2)
+- `TAB` - Accept top suggestion
+- `ESC` - Quit
+
+## iOS Keyboard Extension Integration
+
+```swift
+class KeyboardViewController: UIInputViewController {
+    let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7)
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        // Load from app bundle
+        if let dataDir = Bundle.main.resourceURL?.appendingPathComponent("mmap_data") {
+            spellChecker.loadPrebuilt(from: dataDir)
+        }
+    }
+
+    func checkSpelling(_ word: String) -> [SuggestItem] {
+        return spellChecker.suggestions(for: word, limit: 5)
+    }
+
+    func shouldAutoCorrect(_ word: String) -> String? {
+        return spellChecker.autoCorrection(for: word)
+    }
+}
+```
+
+## Memory Usage Comparison
+
+| Implementation | RAM Usage | Load Time |
+|----------------|-----------|-----------|
+| SymSpell (in-memory) | ~150 MB | ~500ms |
+| LowMemorySymSpell | ~15-20 MB | ~10ms |
+
+The low-memory implementation stays well within the iOS keyboard extension 50MB limit.
 
