@@ -12,6 +12,7 @@ let package = Package(
     products: [
         .library(
             name: "SymSpellSwift",
+            type: .static,
             targets: ["SymSpellSwift"])
     ],
     targets: [
