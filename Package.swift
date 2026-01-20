@@ -20,6 +20,9 @@ let package = Package(
         .executableTarget(
             name: "Benchmark",
             dependencies: ["SymSpellSwift"]),
+        .executableTarget(
+            name: "TUI",
+            dependencies: ["SymSpellSwift"]),
         .testTarget(
             name: "SymSpellSwiftTests",
             dependencies: ["SymSpellSwift"],

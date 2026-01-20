@@ -16,6 +16,11 @@ xcuserdata/
 ## Playgrounds
 timeline.xctimeline
 playground.xcworkspace
+.DS_Store
+mmap_data/
+mmap_data_full/
+mmap_data_small/
+.vscode/
 
 # Swift Package Manager
 #
