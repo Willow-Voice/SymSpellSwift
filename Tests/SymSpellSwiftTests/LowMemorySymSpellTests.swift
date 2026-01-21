@@ -212,6 +212,61 @@ final class LowMemorySymSpellTests: XCTestCase {
         spellChecker.close()
     }
 
+    func testLowMemorySymSpellWordSegmentationMinWordLength() throws {
+        let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
+
+        // Dictionary with single-letter words that should be filtered
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        crazy 10000
+        y 5000
+        w 4000
+        a 3000
+        i 2500
+        highly 8000
+        hi 6000
+        gj 100
+        k 200
+        ahh 1000
+        woah 900
+        what 7000
+        is 5000
+        that 4500
+        am 3500
+        here 3000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // Test cases from IMPROVEMENTS.md
+        // "crazy" should stay as "crazy", not become "crazy y" due to greedy single-letter matching
+        let result1 = spellChecker.wordSegmentation(phrase: "crazy")
+        XCTAssertEqual(result1.correctedString, "crazy")
+
+        // "woahh" should not become "w ahh" - single letter "w" should be filtered
+        let result2 = spellChecker.wordSegmentation(phrase: "woahh")
+        XCTAssertFalse(result2.correctedString.hasPrefix("w "), "Should not segment 'woahh' starting with 'w '")
+
+        // "crazyy" should not become "crazy y"
+        let result3 = spellChecker.wordSegmentation(phrase: "crazyy")
+        XCTAssertFalse(result3.correctedString.hasSuffix(" y"), "Should not segment 'crazyy' ending with ' y'")
+
+        // "iamhere" should become "i am here" - "i" is an allowed single-letter word
+        let result4 = spellChecker.wordSegmentation(phrase: "iamhere")
+        XCTAssertEqual(result4.correctedString, "i am here")
+
+        // "whatisthat" should become "what is that" - valid segmentation with no single letters
+        let result5 = spellChecker.wordSegmentation(phrase: "whatisthat")
+        XCTAssertEqual(result5.correctedString, "what is that")
+
+        // Test with minWordLength = 1 (allowing all single letter words)
+        let result6 = spellChecker.wordSegmentation(phrase: "crazyy", minWordLength: 1)
+        XCTAssertEqual(result6.correctedString, "crazy y", "With minWordLength=1, 'crazyy' should become 'crazy y'")
+
+        spellChecker.close()
+    }
+
     func testLowMemorySymSpellIsValidWord() throws {
         let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
 
