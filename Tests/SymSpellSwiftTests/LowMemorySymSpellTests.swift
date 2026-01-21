@@ -522,6 +522,81 @@ final class LowMemorySymSpellTests: XCTestCase {
         spellChecker.close()
     }
 
+    /// Test correction-aware segmentation (beam search) with misspelled concatenated words
+    func testCorrectionAwareSegmentation() async throws {
+        guard let dictURL = Bundle.module.url(forResource: "frequency_dictionary_en_82_765", withExtension: "txt") else {
+            throw XCTSkip("Dictionary file not available")
+        }
+
+        guard let bigramURL = Bundle.module.url(forResource: "frequency_bigramdictionary_en_243_342", withExtension: "txt") else {
+            throw XCTSkip("Bigram dictionary not available")
+        }
+
+        let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictURL))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramURL))
+
+        // Test correction-aware segmentation: misspelled concatenated words
+        // "helloworlf" should become "hello world" (worlf → world + segmentation)
+        let result1 = spellChecker.wordSegmentation(phrase: "helloworlf")
+        XCTAssertEqual(result1.correctedString, "hello world", "Should correct 'worlf' to 'world' during segmentation")
+        XCTAssertGreaterThan(result1.distanceSum, 0, "Should have edit distance > 0 due to correction")
+
+        // "thequickbrown" - pure segmentation (no corrections needed)
+        let result2 = spellChecker.wordSegmentation(phrase: "thequickbrown")
+        XCTAssertEqual(result2.correctedString, "the quick brown")
+        XCTAssertEqual(result2.distanceSum, 0, "Pure segmentation should have 0 edit distance")
+
+        // Test greedy mode (beamWidth=0) for comparison
+        let greedyResult = spellChecker.wordSegmentation(phrase: "helloworlf", beamWidth: 0)
+        // Greedy mode may not be able to correct the misspelling as well
+        // Just verify it doesn't crash and returns something reasonable
+        XCTAssertFalse(greedyResult.correctedString.isEmpty)
+
+        spellChecker.close()
+    }
+
+    /// Test that valid single words are not incorrectly segmented
+    func testBeamSearchPreservesValidWords() throws {
+        let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
+
+        // Dictionary with common words and some that could be falsely segmented
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        together 5000000
+        to 10000000
+        get 8000000
+        her 6000000
+        something 4000000
+        some 7000000
+        thing 5000000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        // Bigrams that could create false positives
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        to get 1000000
+        get her 500000
+        some thing 800000
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
+
+        // "together" should stay as "together" (not "to get her")
+        let result1 = spellChecker.wordSegmentation(phrase: "together")
+        XCTAssertEqual(result1.correctedString, "together", "Valid word 'together' should not be segmented")
+
+        // "something" should stay as "something" (not "some thing")
+        let result2 = spellChecker.wordSegmentation(phrase: "something")
+        XCTAssertEqual(result2.correctedString, "something", "Valid word 'something' should not be segmented")
+
+        spellChecker.close()
+    }
+
     // MARK: - Keyboard Layout Tests
 
     func testMMapKeyboardLayoutLoad() throws {
@@ -739,5 +814,38 @@ final class LowMemorySymSpellTests: XCTestCase {
         }
 
         spellChecker.close()
+    }
+
+    // MARK: - Version Tests
+
+    func testVersion() {
+        // Test version string format
+        let version = SymSpellSwiftVersion.current
+        XCTAssertFalse(version.isEmpty, "Version should not be empty")
+
+        // Should be semantic version format (x.y.z)
+        let components = version.split(separator: ".")
+        XCTAssertGreaterThanOrEqual(components.count, 3, "Version should have at least 3 components")
+
+        // Test version components are valid
+        XCTAssertGreaterThanOrEqual(SymSpellSwiftVersion.major, 1)
+        XCTAssertGreaterThanOrEqual(SymSpellSwiftVersion.minor, 0)
+        XCTAssertGreaterThanOrEqual(SymSpellSwiftVersion.patch, 0)
+
+        // Test isAtLeast
+        XCTAssertTrue(SymSpellSwiftVersion.isAtLeast(major: 1))
+        XCTAssertTrue(SymSpellSwiftVersion.isAtLeast(major: 1, minor: 0))
+        XCTAssertTrue(SymSpellSwiftVersion.isAtLeast(major: 1, minor: 1, patch: 0))
+        XCTAssertFalse(SymSpellSwiftVersion.isAtLeast(major: 99))
+
+        // Test convenience accessors
+        XCTAssertEqual(LowMemorySymSpell.version, SymSpellSwiftVersion.current)
+        XCTAssertEqual(SymSpell.version, SymSpellSwiftVersion.current)
+
+        // Test version info is not empty
+        XCTAssertFalse(SymSpellSwiftVersion.versionInfo.isEmpty)
+
+        // Print for visibility
+        print("SymSpellSwift Version: \(version)")
     }
 }

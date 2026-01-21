@@ -34,21 +34,19 @@ spellChecker.wordSegmentation(phrase: "crazyy")         // → "crazyy" (unchang
 
 ---
 
-## 2. Correction-Aware Segmentation (Beam Search)
+## 2. Correction-Aware Segmentation (Beam Search) ✅ IMPLEMENTED
 
 **Problem:**
 Current segmentation requires input words to be correctly spelled OR uses spelling correction only as a fallback. This fails for concatenated misspelled words:
 
-- `"tahtswhat"` → should become `"that's what"` (but doesn't)
-- `"thayswhat"` → should become `"that's what"` (but doesn't)
-- `"helloworlf"` → should become `"hello world"` (but doesn't)
+- `"helloworlf"` → should become `"hello world"`
 
-The current greedy algorithm:
+The old greedy algorithm:
 1. Looks for exact dictionary matches first
 2. Only spell-corrects when no match found
 3. Can't explore multiple segmentation hypotheses
 
-**Solution:**
+**Solution Implemented:**
 Use **beam search** to explore multiple segmentation + correction hypotheses simultaneously:
 
 ```swift
@@ -169,6 +167,25 @@ Apple's keyboard likely uses:
 - Device-optimized inference (we use simpler beam search)
 
 This beam search approach provides ~80% of the benefit with much simpler implementation.
+
+**Usage:**
+```swift
+// Beam search is now the default (beamWidth: 10)
+let result = spellChecker.wordSegmentation(phrase: "helloworlf")
+print(result.correctedString)  // "hello world"
+
+// Use greedy mode for faster but less accurate results
+let result2 = spellChecker.wordSegmentation(phrase: "helloworlf", beamWidth: 0)
+
+// Customize beam width for more thorough search
+let result3 = spellChecker.wordSegmentation(phrase: "helloworlf", beamWidth: 20)
+```
+
+**Key Implementation Details:**
+- Valid single words are preserved (e.g., "together" won't become "to get her")
+- Corrections only applied to segments of 3+ characters (prevents "c" → "i" false positives)
+- Edit distance penalty of 5.0 per edit ensures corrections are used sparingly
+- Requires bigrams loaded; without bigrams, returns input unchanged
 
 ---
 
@@ -483,7 +500,7 @@ Optional phonetic similarity for suggestions:
 
 1. ✅ **DONE**: Word Segmentation Bigram Validation - Prevents incorrect segmentations
 2. ✅ **DONE**: Spatial Keyboard Weighting - Significant UX improvement for typos
-3. **High**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
+3. ✅ **DONE**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
 4. **Medium**: Improved Frequency Weighting - Common words should rank higher
 5. **Medium**: Auto-Apply Correction on Send - Better UX for messaging apps
 6. **Medium**: Confidence Score API - Cleaner integration

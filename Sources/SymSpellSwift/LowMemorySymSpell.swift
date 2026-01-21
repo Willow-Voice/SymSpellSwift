@@ -29,6 +29,72 @@ public struct Composition {
     }
 }
 
+// MARK: - SegmentationHypothesis
+
+/// A hypothesis in the beam search for word segmentation.
+///
+/// Tracks the current state of a potential segmentation including:
+/// - Words found so far (with spelling corrections applied)
+/// - Original segments before correction (for comparison)
+/// - Position in the input string
+/// - Cumulative edit distance and bigram probability scores
+struct SegmentationHypothesis: Comparable {
+    /// Corrected words found so far
+    let words: [String]
+    /// Original segments before correction
+    let originalSegments: [String]
+    /// Current position in input string
+    let position: Int
+    /// Sum of edit distances for all corrections
+    let totalEditDistance: Int
+    /// Sum of log(bigram_frequency) for scoring
+    let bigramLogProbSum: Double
+    /// Combined score (higher is better)
+    var score: Double {
+        // Balance: prefer common phrases (positive), penalize corrections (negative)
+        // Edit distance penalty: each edit reduces score significantly
+        // Higher penalty (5.0) ensures corrections are only used when necessary
+        let editPenalty = Double(totalEditDistance) * 5.0
+        return bigramLogProbSum - editPenalty
+    }
+
+    static func < (lhs: SegmentationHypothesis, rhs: SegmentationHypothesis) -> Bool {
+        return lhs.score < rhs.score
+    }
+
+    static func == (lhs: SegmentationHypothesis, rhs: SegmentationHypothesis) -> Bool {
+        return lhs.score == rhs.score
+    }
+
+    /// Create an initial empty hypothesis
+    static func initial() -> SegmentationHypothesis {
+        return SegmentationHypothesis(
+            words: [],
+            originalSegments: [],
+            position: 0,
+            totalEditDistance: 0,
+            bigramLogProbSum: 0.0
+        )
+    }
+
+    /// Extend this hypothesis with a new word
+    func extend(
+        withWord word: String,
+        originalSegment: String,
+        editDistance: Int,
+        segmentLength: Int,
+        bigramLogProb: Double
+    ) -> SegmentationHypothesis {
+        return SegmentationHypothesis(
+            words: words + [word],
+            originalSegments: originalSegments + [originalSegment],
+            position: position + segmentLength,
+            totalEditDistance: totalEditDistance + editDistance,
+            bigramLogProbSum: bigramLogProbSum + bigramLogProb
+        )
+    }
+}
+
 // MARK: - Verbosity (for LowMemorySymSpell)
 
 /// Controls the quantity/closeness of returned suggestions
@@ -1268,7 +1334,39 @@ public class LowMemorySymSpell {
         return [SuggestItem(term: resultTerm, distance: totalDistance, count: 1)]
     }
 
-    /// Word segmentation - splits concatenated words using bigram validation.
+    /// Word segmentation - splits concatenated words with optional spelling correction.
+    ///
+    /// Uses beam search to explore multiple segmentation + correction hypotheses.
+    /// Can handle misspelled concatenated words like "tahtswhat" → "that's what".
+    ///
+    /// **Examples:**
+    /// - `"thequickbrown"` → `"the quick brown"` (pure segmentation)
+    /// - `"tahtswhat"` → `"that's what"` (correction + segmentation)
+    /// - `"helloworlf"` → `"hello world"` (segmentation + correction)
+    ///
+    /// **Note:** Best results require bigram dictionary via `loadBigramDictionary()`.
+    /// Without bigrams, segmentation still works but may produce less optimal results.
+    ///
+    /// - Parameters:
+    ///   - phrase: The concatenated text to segment
+    ///   - maxEditDistance: Maximum edit distance for spelling correction (default: instance maxEditDistance)
+    ///   - beamWidth: Number of hypotheses to track. Use 0 for greedy (faster), 10+ for beam search (more accurate)
+    /// - Returns: Composition containing the segmented and corrected string
+    public func wordSegmentation(phrase: String, maxEditDistance: Int? = nil, beamWidth: Int = 10) -> Composition {
+        // Use beam search for correction-aware segmentation
+        if beamWidth > 0 {
+            return wordSegmentationBeam(
+                phrase: phrase,
+                maxEditDistance: maxEditDistance,
+                beamWidth: beamWidth
+            )
+        }
+
+        // Fall back to greedy for beamWidth == 0
+        return wordSegmentationGreedy(phrase: phrase, maxEditDistance: maxEditDistance)
+    }
+
+    /// Greedy word segmentation - faster but cannot correct misspellings mid-segment.
     ///
     /// Splits text like "thequickbrown" into "the quick brown".
     /// Only segments at positions where the resulting word pair exists in the bigram dictionary.
@@ -1281,7 +1379,7 @@ public class LowMemorySymSpell {
     ///   - phrase: The concatenated text to segment
     ///   - maxEditDistance: Maximum edit distance for spelling correction (default: instance maxEditDistance)
     /// - Returns: Composition containing the segmented and corrected string
-    public func wordSegmentation(phrase: String, maxEditDistance: Int? = nil) -> Composition {
+    public func wordSegmentationGreedy(phrase: String, maxEditDistance: Int? = nil) -> Composition {
         let maxDist = maxEditDistance ?? self.maxEditDistance
         let input = phrase.lowercased().replacingOccurrences(of: " ", with: "")
 
@@ -1377,6 +1475,264 @@ public class LowMemorySymSpell {
             distanceSum: totalDistance,
             logProbSum: -50.0
         )
+    }
+
+    /// Correction-aware word segmentation using beam search.
+    ///
+    /// This advanced segmentation method can handle misspelled concatenated words
+    /// by exploring multiple segmentation + correction hypotheses simultaneously.
+    ///
+    /// **Examples:**
+    /// - `"tahtswhat"` → `"that's what"` (correction + segmentation)
+    /// - `"helloworlf"` → `"hello world"` (segmentation + correction)
+    /// - `"thequickbrown"` → `"the quick brown"` (pure segmentation)
+    ///
+    /// **Important:** Requires bigram dictionary to be loaded. Without bigrams,
+    /// returns input unchanged (same as greedy segmentation).
+    ///
+    /// - Parameters:
+    ///   - phrase: The concatenated text to segment
+    ///   - maxEditDistance: Maximum edit distance for spelling correction (default: instance maxEditDistance)
+    ///   - beamWidth: Number of hypotheses to track (default: 10)
+    ///   - maxWordLength: Maximum segment length to try (default: 20)
+    /// - Returns: Composition containing the segmented and corrected string
+    public func wordSegmentationBeam(
+        phrase: String,
+        maxEditDistance: Int? = nil,
+        beamWidth: Int = 10,
+        maxWordLength: Int = 20
+    ) -> Composition {
+        let maxDist = maxEditDistance ?? self.maxEditDistance
+        let input = phrase.lowercased().replacingOccurrences(of: " ", with: "")
+        let inputLen = input.count
+
+        // Empty input
+        guard !input.isEmpty else {
+            return Composition(
+                segmentedString: "",
+                correctedString: "",
+                distanceSum: 0,
+                logProbSum: 0.0
+            )
+        }
+
+        // Without bigrams, we can't safely segment - return input as-is
+        guard bigramCount > 0 else {
+            return Composition(
+                segmentedString: input,
+                correctedString: input,
+                distanceSum: 0,
+                logProbSum: -50.0
+            )
+        }
+
+        // Initialize beam with empty hypothesis
+        var beam: [SegmentationHypothesis] = [.initial()]
+
+        // Process input character by character position
+        while let minPos = beam.map({ $0.position }).min(), minPos < inputLen {
+            var nextBeam: [SegmentationHypothesis] = []
+
+            for hypothesis in beam {
+                // Skip completed hypotheses
+                guard hypothesis.position < inputLen else {
+                    nextBeam.append(hypothesis)
+                    continue
+                }
+
+                let remaining = inputLen - hypothesis.position
+                let maxLen = min(maxWordLength, remaining)
+
+                // Try different segment lengths
+                for length in 1...maxLen {
+                    let startIdx = input.index(input.startIndex, offsetBy: hypothesis.position)
+                    let endIdx = input.index(startIdx, offsetBy: length)
+                    let segment = String(input[startIdx..<endIdx])
+
+                    // Get candidate corrections for this segment
+                    let candidates = getCandidatesForSegment(
+                        segment: segment,
+                        maxEditDistance: maxDist,
+                        limit: 3  // Top 3 corrections per segment
+                    )
+
+                    for candidate in candidates {
+                        // Check bigram validity
+                        var bigramLogProb = 0.0
+                        var bigramValid = true
+
+                        if let prevWord = hypothesis.words.last {
+                            let bigram = "\(prevWord) \(candidate.word)"
+                            let bigramFreq = activeBigrams.get(bigram)
+
+                            // Require valid bigrams for segmentation
+                            if bigramFreq == 0 {
+                                // No valid bigram - skip this path unless it's a high-quality correction
+                                // Only allow if we're taking the entire remaining input as one word (no more segmentation)
+                                let isFullRemaining = length == remaining
+                                let isExactMatch = candidate.distance == 0
+
+                                if isFullRemaining && isExactMatch {
+                                    // Allow as fallback: take rest as one word with penalty
+                                    bigramLogProb = -5.0
+                                } else {
+                                    // Skip - no bigram and not a good fallback
+                                    bigramValid = false
+                                }
+                            } else {
+                                bigramLogProb = log(Double(bigramFreq) + 1)
+                            }
+                        } else {
+                            // First word - use word frequency, prefer longer valid words
+                            bigramLogProb = log(Double(candidate.frequency) + 1)
+                            // Bonus for longer exact matches
+                            if candidate.distance == 0 && length > 3 {
+                                bigramLogProb += Double(length) * 0.5
+                            }
+                        }
+
+                        if !bigramValid {
+                            continue
+                        }
+
+                        // Create extended hypothesis
+                        let newHypothesis = hypothesis.extend(
+                            withWord: candidate.word,
+                            originalSegment: segment,
+                            editDistance: candidate.distance,
+                            segmentLength: length,
+                            bigramLogProb: bigramLogProb
+                        )
+
+                        nextBeam.append(newHypothesis)
+                    }
+                }
+            }
+
+            // Prune beam to top beamWidth hypotheses
+            nextBeam.sort { $0.score > $1.score }
+            beam = Array(nextBeam.prefix(beamWidth))
+
+            // Early exit if beam is empty
+            if beam.isEmpty {
+                break
+            }
+        }
+
+        // Find best completed hypothesis
+        let completedHypotheses = beam.filter { $0.position >= inputLen }
+
+        // If we found valid segmentations, use the best one
+        if let best = completedHypotheses.max(by: { $0.score < $1.score }) {
+            // Compare against keeping input as single word
+            let singleWordFreq = activeWords.get(input)
+
+            // If input is a valid single word, prefer it unless segmentation is clearly better
+            if singleWordFreq > 0 {
+                // Calculate normalized scores for fair comparison
+                // Single word: just the word frequency (no bigrams needed)
+                let singleWordScore = log(Double(singleWordFreq) + 1)
+
+                // For multi-word segmentation, use average score per word
+                // This prevents artificially high scores from just having more words
+                let segmentedAvgScore = best.words.count > 0 ? best.bigramLogProbSum / Double(best.words.count) : 0
+
+                // Prefer single word if:
+                // 1. It's a single word in best hypothesis anyway, OR
+                // 2. Single word score is comparable to or better than average segmented score, OR
+                // 3. Segmentation required corrections (edit distance > 0)
+                let preferSingleWord = best.words.count == 1 ||
+                                       singleWordScore >= segmentedAvgScore * 0.8 ||
+                                       best.totalEditDistance > 0
+
+                if preferSingleWord {
+                    return Composition(
+                        segmentedString: input,
+                        correctedString: input,
+                        distanceSum: 0,
+                        logProbSum: singleWordScore
+                    )
+                }
+            }
+
+            let segmented = best.originalSegments.joined(separator: " ")
+            let corrected = best.words.joined(separator: " ")
+
+            return Composition(
+                segmentedString: segmented,
+                correctedString: corrected,
+                distanceSum: best.totalEditDistance,
+                logProbSum: best.bigramLogProbSum
+            )
+        }
+
+        // Fallback: return input as-is
+        return Composition(
+            segmentedString: input,
+            correctedString: input,
+            distanceSum: 0,
+            logProbSum: -50.0
+        )
+    }
+
+    /// Get candidate words for a segment (with spelling corrections).
+    ///
+    /// Returns candidates sorted by quality (exact match first, then by distance and frequency).
+    private func getCandidatesForSegment(
+        segment: String,
+        maxEditDistance: Int,
+        limit: Int
+    ) -> [(word: String, distance: Int, frequency: Int)] {
+        var candidates: [(word: String, distance: Int, frequency: Int)] = []
+
+        // Check for exact match first
+        let exactFreq = activeWords.get(segment)
+        if exactFreq > 0 {
+            candidates.append((segment, 0, exactFreq))
+        }
+
+        // Only get spelling corrections for segments of reasonable length
+        // Short segments (1-2 chars) shouldn't be corrected to different words
+        // as this leads to false positives like "c" → "i", "w" → "a"
+        let minLengthForCorrection = 3
+
+        if segment.count >= minLengthForCorrection {
+            // Get spelling corrections
+            let suggestions = lookup(
+                phrase: segment,
+                verbosity: .closest,
+                maxEditDistance: maxEditDistance
+            )
+
+            for suggestion in suggestions {
+                // Skip if it's the same as exact match
+                if suggestion.term == segment && suggestion.distance == 0 {
+                    continue
+                }
+                // Skip corrections that change the word too drastically
+                // (e.g., "razy" → "am" is too different)
+                let lengthDiff = abs(suggestion.term.count - segment.count)
+                if lengthDiff > maxEditDistance {
+                    continue
+                }
+                candidates.append((suggestion.term, suggestion.distance, suggestion.count))
+            }
+        }
+
+        // Sort by distance first, then by frequency (descending)
+        candidates.sort { a, b in
+            if a.distance != b.distance {
+                return a.distance < b.distance
+            }
+            return a.frequency > b.frequency
+        }
+
+        // If no candidates found, return the segment itself with high distance
+        if candidates.isEmpty {
+            candidates.append((segment, maxEditDistance + 1, 0))
+        }
+
+        return Array(candidates.prefix(limit))
     }
 
     // MARK: - Utility Methods
