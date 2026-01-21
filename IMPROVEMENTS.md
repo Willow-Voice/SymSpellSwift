@@ -323,7 +323,135 @@ Input: "speling"
 
 ---
 
-## 5. Future Considerations
+## 5. Auto-Apply Correction on Send (Investigation)
+
+**Problem:**
+When a user finishes typing and presses "Send" (or Return/Enter), the last word may still be misspelled with a pending autocorrection suggestion visible. Currently, the user must manually accept the correction before sending, which adds friction to the messaging experience.
+
+**Desired Behavior:**
+Automatically apply the top autocorrection suggestion to the last word when the user presses Send, similar to iOS keyboard behavior:
+
+```
+User types: "See you tomorow"
+                      ↑ suggestion: "tomorrow"
+User presses Send → Message sent: "See you tomorrow"
+```
+
+**Investigation Areas:**
+
+1. **When to auto-apply:**
+   - Only when there's a high-confidence suggestion (confidence > threshold)?
+   - Only for distance-1 corrections to avoid aggressive changes?
+   - Never for proper nouns or capitalized words?
+   - What if the "misspelled" word is actually intentional (slang, names)?
+
+2. **API Design Options:**
+
+   ```swift
+   // Option A: Explicit method for send-time correction
+   func finalizeText(_ text: String) -> String {
+       // Returns text with last word auto-corrected if appropriate
+   }
+   
+   // Option B: Include in lookup response
+   struct SuggestItem {
+       let term: String
+       let distance: Int
+       let frequency: Int
+       let shouldAutoApply: Bool  // NEW: Recommendation for auto-apply
+   }
+   
+   // Option C: Separate confidence check
+   func shouldAutoCorrect(
+       original: String,
+       suggestion: SuggestItem,
+       context: AutoCorrectContext
+   ) -> Bool
+   ```
+
+3. **Confidence Thresholds:**
+   - What confidence level justifies auto-applying?
+   - Should frequency ratio matter? (suggestion freq / original freq)
+   - How does edit distance factor in?
+   
+   ```swift
+   struct AutoCorrectPolicy {
+       let minConfidence: Double        // e.g., 0.85
+       let maxEditDistance: Int         // e.g., 1
+       let minFrequencyRatio: Double    // e.g., 10.0 (suggestion 10x more common)
+       let excludeCapitalized: Bool     // Don't correct "iPhone" → "iphone"
+   }
+   ```
+
+4. **User override/undo:**
+   - Should there be a way to undo auto-corrections?
+   - Learn from rejected corrections?
+   - This is likely UI-layer responsibility, not library
+
+5. **Edge Cases to Handle:**
+   - Empty correction (word not in dictionary but no good suggestion)
+   - Multiple equally-good suggestions
+   - Word is correct but rare (don't "correct" valid words)
+   - Partial words / abbreviations ("omw", "brb")
+   - URLs, email addresses, @mentions
+
+**Potential Implementation:**
+
+```swift
+public struct AutoCorrectResult {
+    let originalWord: String
+    let correctedWord: String?      // nil if no correction applied
+    let confidence: Double
+    let wasApplied: Bool
+    let reason: AutoCorrectReason   // .applied, .lowConfidence, .excluded, etc.
+}
+
+extension LowMemorySymSpell {
+    /// Processes text for sending, auto-correcting the last word if appropriate
+    func prepareForSend(
+        _ text: String,
+        policy: AutoCorrectPolicy = .default
+    ) -> (text: String, correction: AutoCorrectResult?) {
+        guard let lastWord = extractLastWord(text) else {
+            return (text, nil)
+        }
+        
+        let suggestions = lookup(phrase: lastWord, verbosity: .closest)
+        guard let top = suggestions.first else {
+            return (text, nil)
+        }
+        
+        // Check if auto-correction is appropriate
+        let shouldCorrect = evaluateAutoCorrect(
+            original: lastWord,
+            suggestion: top,
+            policy: policy
+        )
+        
+        if shouldCorrect {
+            let correctedText = replaceLastWord(text, with: top.term)
+            return (correctedText, AutoCorrectResult(...))
+        }
+        
+        return (text, nil)
+    }
+}
+```
+
+**Questions to Resolve:**
+- Is this in scope for the library, or should it be UI/app responsibility?
+- How aggressive should default policy be?
+- Should we provide "undo" data to help apps implement undo?
+- How does this interact with word segmentation?
+
+**Reference:**
+- iOS auto-correction applies on space/punctuation/send
+- Android Gboard has similar behavior with configurable aggressiveness
+- Both allow words to be "learned" to prevent future corrections
+
+---
+
+## 6. Future Considerations
 
 ### Confidence Score API
 Expose confidence calculations directly from the library:
@@ -357,6 +485,7 @@ Optional phonetic similarity for suggestions:
 2. ✅ **DONE**: Spatial Keyboard Weighting - Significant UX improvement for typos
 3. **High**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
 4. **Medium**: Improved Frequency Weighting - Common words should rank higher
-5. **Medium**: Confidence Score API - Cleaner integration
-6. **Low**: Custom Dictionary Tiers - Nice to have
-7. **Low**: Phonetic Matching - Complex implementation
+5. **Medium**: Auto-Apply Correction on Send - Better UX for messaging apps
+6. **Medium**: Confidence Score API - Cleaner integration
+7. **Low**: Custom Dictionary Tiers - Nice to have
+8. **Low**: Phonetic Matching - Complex implementation

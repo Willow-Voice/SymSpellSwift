@@ -1,0 +1,4 @@
+itll -> i'll (should be it'll)
+autocoreecg -> [no change] (should be autocorrect)
+well -> we'll (should not have changed)
+habjgn -> [no change] (should be having)

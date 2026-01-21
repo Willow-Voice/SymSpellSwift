@@ -1147,17 +1147,42 @@ public class LowMemorySymSpell {
     /// ```
     public func autoCorrection(for word: String, minConfidence: Double = 0.75) -> (term: String, confidence: Double)? {
         let lowercaseWord = word.lowercased()
-
-        // Return nil if word is already valid
-        if activeWords.get(lowercaseWord) > 0 {
-            return nil
-        }
+        let wordFrequency = activeWords.get(lowercaseWord)
+        let isValid = wordFrequency > 0
 
         // Get suggestions with all verbosity to assess ambiguity
         let suggestions = lookup(phrase: lowercaseWord, verbosity: .all, maxEditDistance: maxEditDistance)
 
         guard let top = suggestions.first else {
             return nil  // No suggestions found
+        }
+
+        // If word is valid, only suggest correction if there's a MUCH more popular alternative
+        if isValid {
+            // Find best suggestion that isn't the word itself
+            guard let bestAlt = suggestions.first(where: { $0.term != lowercaseWord && $0.distance > 0 }) else {
+                return nil  // No alternatives
+            }
+
+            // Only consider correction if:
+            // 1. Alternative is distance 1 (close typo)
+            // 2. Alternative is significantly more popular (10x or more)
+            let frequencyRatio = Double(bestAlt.count) / Double(max(1, wordFrequency))
+            if bestAlt.distance == 1 && frequencyRatio >= 10.0 {
+                // Apply heavy penalty - valid words are usually intentional
+                // Max confidence of 0.6 for valid word corrections
+                let confidence = min(0.6, 0.3 + (frequencyRatio / 100.0) * 0.3)
+                if confidence >= minConfidence {
+                    return (bestAlt.term, confidence)
+                }
+            }
+
+            return nil  // Valid word, keep it
+        }
+
+        // Word is not valid - normal correction logic
+        guard top.distance > 0 else {
+            return nil  // Shouldn't happen, but safety check
         }
 
         // Calculate confidence score
@@ -1426,7 +1451,7 @@ public class LowMemorySymSpell {
     ///   - s1: First string
     ///   - s2: Second string
     ///   - maxDistance: Maximum distance to calculate
-    /// - Returns: Edit distance (floored to int), or -1 if distance exceeds maxDistance
+    /// - Returns: Edit distance (ceiling of weighted distance), or -1 if distance exceeds maxDistance
     private func damerauLevenshteinDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Int {
         // Handle empty strings
         guard !s1.isEmpty else {
@@ -1446,12 +1471,17 @@ public class LowMemorySymSpell {
 
         // Use keyboard-weighted distance if available
         if let keyboard = keyboard, keyboard.keyboardLayout != .none {
-            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+            // For keyboard-weighted distance, allow exploring more candidates
+            // by using a higher internal maxDistance
+            let internalMaxDist = maxDistance * 2
+            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: internalMaxDist, keyboard: keyboard)
             if weightedDist < 0 {
                 return -1
             }
-            // Floor the weighted distance to int for compatibility with existing sorting
-            return Int(weightedDist)
+            // Use ceiling so that 0.5 becomes 1 (not same as exact match)
+            // But cap at maxDistance for the returned value
+            let ceiledDist = Int(ceil(weightedDist))
+            return ceiledDist <= maxDistance ? ceiledDist : -1
         }
 
         // Use the existing String extension for edit distance
@@ -1468,7 +1498,8 @@ public class LowMemorySymSpell {
     /// - Returns: Weighted edit distance, or -1 if exceeds maxDistance
     private func weightedEditDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Double {
         if let keyboard = keyboard, keyboard.keyboardLayout != .none {
-            return weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+            let internalMaxDist = maxDistance * 2
+            return weightedDamerauLevenshteinDistance(s1, s2, maxDistance: internalMaxDist, keyboard: keyboard)
         }
         let dist = s1.distanceDamerauLevenshtein(between: s2)
         return dist <= maxDistance ? Double(dist) : -1.0
@@ -1536,13 +1567,50 @@ extension LowMemorySymSpell: KeyboardSpellChecker {
     ///
     /// Returns a correction only if confidence is >= 75%.
     ///
+    /// For valid words that might be typos of more common words:
+    /// - Only suggests if the correction is significantly more popular (10x+)
+    /// - Applies heavy confidence penalty since valid words are usually intentional
+    ///
     /// - Parameter word: The word to check
     /// - Returns: The correction if confident, nil otherwise
     public func autoCorrection(for word: String) -> String? {
-        let suggestions = lookup(phrase: word, verbosity: .all, maxEditDistance: maxEditDistance)
+        let lowercaseWord = word.lowercased()
+        let wordFrequency = getWordFrequency(lowercaseWord)
+        let isValid = wordFrequency > 0
 
-        guard let top = suggestions.first, top.distance > 0 else {
-            return nil  // Word is correct or not found
+        let suggestions = lookup(phrase: lowercaseWord, verbosity: .all, maxEditDistance: maxEditDistance)
+
+        guard let top = suggestions.first else {
+            return nil  // No suggestions found
+        }
+
+        // If word is valid (exact match), it will be in suggestions with distance 0
+        // We want to consider if there's a MUCH more popular word at distance 1
+        if isValid {
+            // Find best suggestion that isn't the word itself
+            guard let bestAlt = suggestions.first(where: { $0.term != lowercaseWord && $0.distance > 0 }) else {
+                return nil  // No alternatives
+            }
+
+            // Only consider correction if:
+            // 1. Alternative is distance 1 (close typo)
+            // 2. Alternative is significantly more popular (10x or more)
+            let frequencyRatio = Double(bestAlt.count) / Double(max(1, wordFrequency))
+            if bestAlt.distance == 1 && frequencyRatio >= 10.0 {
+                // Apply heavy penalty - valid words are usually intentional
+                // Base confidence from frequency ratio, but capped low
+                let confidence = min(0.6, 0.3 + (frequencyRatio / 100.0) * 0.3)
+                if confidence >= 0.5 {
+                    return bestAlt.term
+                }
+            }
+
+            return nil  // Valid word, keep it
+        }
+
+        // Word is not valid - normal correction logic
+        guard top.distance > 0 else {
+            return nil  // Shouldn't happen, but safety check
         }
 
         // Calculate confidence

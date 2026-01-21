@@ -615,16 +615,21 @@ public class SymSpell {
     ///   - s1: First string
     ///   - s2: Second string
     ///   - maxDistance: Maximum distance to calculate
-    /// - Returns: Edit distance, or max distance + 1 if exceeds maxDistance
+    /// - Returns: Edit distance (ceiling of weighted distance), or max distance + 1 if exceeds maxDistance
     private func editDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Int {
         // Use keyboard-weighted distance if available
         if let keyboard = keyboard, keyboard.keyboardLayout != .none {
-            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+            // For keyboard-weighted distance, allow exploring more candidates
+            // by using a higher internal maxDistance
+            let internalMaxDist = maxDistance * 2
+            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: internalMaxDist, keyboard: keyboard)
             if weightedDist < 0 {
                 return maxDistance + 1
             }
-            // Floor the weighted distance to int for compatibility with existing sorting
-            return Int(weightedDist)
+            // Use ceiling so that 0.5 becomes 1 (not same as exact match)
+            // But cap at maxDistance for the returned value
+            let ceiledDist = Int(ceil(weightedDist))
+            return ceiledDist <= maxDistance ? ceiledDist : maxDistance + 1
         }
 
         // Use standard distance
