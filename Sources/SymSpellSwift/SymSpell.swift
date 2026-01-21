@@ -352,112 +352,122 @@ public class SymSpell {
         return [suggestion]
     }
 
-    /// Common single-letter words allowed even when minWordLength > 1
-    private static let allowedSingleLetterWords: Set<String> = ["i", "a"]
-
     /// Divides a string into words by inserting missing spaces at the appropriate positions.
-    /// Misspelled words are corrected and do not affect segmentation, existing spaces are allowed and considered for optimum segmentation.
+    /// Only segments at positions where the resulting word pair exists in the bigram dictionary.
+    /// Misspelled words are corrected and do not affect segmentation.
+    ///
+    /// **Important:** Requires bigram dictionary to be loaded via `loadBigramDictionary()`.
+    /// Without bigrams loaded, returns the input unchanged.
+    ///
     /// - Parameters:
     ///   - input: The text to segment
     ///   - maxEditDistance: Maximum edit distance for spelling correction
-    ///   - minWordLength: Minimum length for segmented words (default: 2). Single-letter words like "y" or "w" won't be used in segmentation unless they're common words like "I" or "a".
     /// - Returns: A `Segmentation` struct, containing:
     ///    - the segmented string,
     ///    - the segmented and spelling corrected string,
     ///    - the Edit distance sum between input string and corrected string,
     ///    - the Sum of word occurence probabilities in log scale (a measure of how common and probable the corrected segmentation is).
 
-    public func wordSegmentation(_ input: String, maxEditDistance: Int = 0, minWordLength: Int = 2) -> Segmentation {
+    public func wordSegmentation(_ input: String, maxEditDistance: Int = 0) -> Segmentation {
         // Normalize ligatures and replace hyphens
-        let input = input.precomposedStringWithCompatibilityMapping.replacingOccurrences(of: "\u{002D}", with: "")
+        let normalizedInput = input.precomposedStringWithCompatibilityMapping
+            .replacingOccurrences(of: "\u{002D}", with: "")
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
 
-        let arraySize = min(maxDictionaryWordLength, input.count)
-        var compositions: [Segmentation] = Array(repeating: Segmentation(), count: arraySize)
-        var circularIndex = -1
-
-        // Outer loop (columns): all possible part start positions
-        for j in 0 ..< input.count {
-            // Inner loop (rows): all possible part lengths (from start position)
-
-            for i in 1 ... min(input.count - j, maxDictionaryWordLength) {
-                guard var partSubstr = input[j ..< j + i] else { continue }
-
-                var separatorLength = 0
-                var topEd = 0
-                var topProbabilityLog = 0.0
-                var topResult = ""
-
-                if partSubstr.first?.isWhitespace == true {
-                    // Remove leading space for edit distance calculation
-                    partSubstr.removeFirst()
-                } else {
-                    // Space had to be inserted
-                    separatorLength = 1
-                }
-
-                // Calculate edit distance
-                topEd += partSubstr.count
-                let part = partSubstr.replacingOccurrences(of: " ", with: "")
-                topEd -= part.count
-
-                // Skip parts shorter than minWordLength unless they are allowed single-letter words
-                // This prevents segmentation like "crazy y" when minWordLength > 1
-                if part.count < minWordLength && !Self.allowedSingleLetterWords.contains(part.lowercased()) {
-                    continue
-                }
-
-                let results = lookup(part.lowercased(), verbosity: .top, maxEditDistance: maxEditDistance)
-
-                // Filter results by minWordLength - reject words shorter than minimum unless they're allowed single-letter words
-                let filteredResult = results.first.flatMap { result -> SuggestItem? in
-                    if result.term.count < minWordLength && !Self.allowedSingleLetterWords.contains(result.term.lowercased()) {
-                        return nil
-                    }
-                    return result
-                }
-
-                if let result = filteredResult {
-                    topResult = result.term
-                    if part.first?.isUppercase == true {
-                        topResult = topResult.prefix(1).uppercased() + topResult.dropFirst()
-                    }
-                    topEd += result.distance
-                    topProbabilityLog = log10(Double(result.count) / Double(totalCorpusWords))
-                } else {
-                    topResult = part
-                    topEd += part.count
-                    topProbabilityLog = log10(10.0 / (Double(totalCorpusWords) * pow(10.0, Double(part.count))))
-                }
-
-                let destinationIndex = (i + circularIndex) % arraySize
-
-                if j == 0 {
-                    compositions[destinationIndex] = Segmentation(segmentedString: part, correctedString: topResult, distanceSum: topEd, probabilityLogSum: topProbabilityLog)
-                } else if i == maxDictionaryWordLength
-                    || ((compositions[circularIndex].distanceSum + topEd == compositions[destinationIndex].distanceSum) || (compositions[circularIndex].distanceSum + separatorLength + topEd == compositions[destinationIndex].distanceSum)) && (compositions[destinationIndex].probabilityLogSum < compositions[circularIndex].probabilityLogSum + topProbabilityLog)
-                    || compositions[circularIndex].distanceSum + separatorLength + topEd < compositions[destinationIndex].distanceSum {
-                    if topResult.count == 1, topResult.first?.isPunctuation == true {
-                        compositions[destinationIndex] = Segmentation(
-                            segmentedString: compositions[circularIndex].segmentedString + part,
-                            correctedString: compositions[circularIndex].correctedString + topResult,
-                            distanceSum: compositions[circularIndex].distanceSum + topEd,
-                            probabilityLogSum: compositions[circularIndex].probabilityLogSum + topProbabilityLog
-                        )
-                    } else {
-                        compositions[destinationIndex] = Segmentation(
-                            segmentedString: compositions[circularIndex].segmentedString + " " + part,
-                            correctedString: compositions[circularIndex].correctedString + " " + topResult,
-                            distanceSum: compositions[circularIndex].distanceSum + separatorLength + topEd,
-                            probabilityLogSum: compositions[circularIndex].probabilityLogSum + topProbabilityLog
-                        )
-                    }
-                }
-            }
-            circularIndex += 1
-            if circularIndex == arraySize { circularIndex = 0 }
+        // Without bigrams, we can't safely segment - return input as-is
+        guard !bigrams.isEmpty else {
+            return Segmentation(segmentedString: normalizedInput, correctedString: normalizedInput, distanceSum: 0, probabilityLogSum: -50.0)
         }
 
-        return compositions[circularIndex]
+        var resultParts: [String] = []
+        var i = 0
+        var totalDistance = 0
+        var totalProbLog = 0.0
+
+        while i < normalizedInput.count {
+            var bestCorrected: String? = nil
+            var bestLen = 0
+            var bestBigramScore = 0
+            var bestDistance = 0
+            var bestProbLog = 0.0
+
+            // Try different lengths (longest first - greedy)
+            for length in stride(from: min(maxDictionaryWordLength, normalizedInput.count - i), through: 1, by: -1) {
+                let startIdx = normalizedInput.index(normalizedInput.startIndex, offsetBy: i)
+                let endIdx = normalizedInput.index(startIdx, offsetBy: length)
+                let word = String(normalizedInput[startIdx..<endIdx])
+
+                // Look up the word
+                let results = lookup(word, verbosity: .top, maxEditDistance: maxEditDistance)
+                guard let result = results.first else { continue }
+
+                // For first word, no bigram check needed
+                // For subsequent words, must have valid bigram with previous word
+                var bigramScore = 1  // Default score for first word
+                if !resultParts.isEmpty {
+                    let bigram = "\(resultParts.last!) \(result.term)"
+                    if let score = bigrams[bigram] {
+                        bigramScore = score
+                    } else {
+                        // Bigram doesn't exist, skip this candidate
+                        continue
+                    }
+                }
+
+                let probLog = log10(Double(result.count) / Double(totalCorpusWords))
+
+                // Prefer higher bigram score, then longer words
+                let isBetter = bigramScore > bestBigramScore ||
+                    (bigramScore == bestBigramScore && length > bestLen)
+
+                if isBetter {
+                    bestCorrected = result.term
+                    bestLen = length
+                    bestBigramScore = bigramScore
+                    bestDistance = result.distance
+                    bestProbLog = probLog
+                }
+            }
+
+            if let corrected = bestCorrected {
+                resultParts.append(corrected)
+                totalDistance += bestDistance
+                totalProbLog += bestProbLog
+                i += bestLen
+            } else if !resultParts.isEmpty {
+                // No valid bigram continuation found - append char to previous word
+                let startIdx = normalizedInput.index(normalizedInput.startIndex, offsetBy: i)
+                let char = String(normalizedInput[startIdx])
+                resultParts[resultParts.count - 1] += char
+                totalDistance += 1
+                i += 1
+            } else {
+                // No first word found - try spelling correction for longer segment
+                let maxLen = min(10, normalizedInput.count - i)
+                let startIdx = normalizedInput.index(normalizedInput.startIndex, offsetBy: i)
+                let endIdx = normalizedInput.index(startIdx, offsetBy: maxLen)
+                let testWord = String(normalizedInput[startIdx..<endIdx])
+
+                let suggestions = lookup(testWord, verbosity: .top, maxEditDistance: maxEditDistance)
+
+                if let first = suggestions.first {
+                    resultParts.append(first.term)
+                    totalDistance += first.distance
+                    totalProbLog += log10(Double(first.count) / Double(totalCorpusWords))
+                    i += testWord.count
+                } else {
+                    // No match - take single character
+                    let charIdx = normalizedInput.index(normalizedInput.startIndex, offsetBy: i)
+                    resultParts.append(String(normalizedInput[charIdx]))
+                    totalDistance += 1
+                    i += 1
+                }
+            }
+        }
+
+        let segmented = resultParts.joined(separator: " ")
+        return Segmentation(segmentedString: segmented, correctedString: segmented, distanceSum: totalDistance, probabilityLogSum: totalProbLog)
     }
     
     /// Completes a correctly spelled prefix to different suggestions

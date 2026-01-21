@@ -204,7 +204,17 @@ final class LowMemorySymSpellTests: XCTestCase {
         """
         try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
 
+        // Bigram dictionary for valid word pairs
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        the quick 1000
+        quick brown 800
+        brown fox 600
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
         XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
 
         let result = spellChecker.wordSegmentation(phrase: "thequickbrownfox")
         XCTAssertEqual(result.correctedString, "the quick brown fox")
@@ -212,57 +222,85 @@ final class LowMemorySymSpellTests: XCTestCase {
         spellChecker.close()
     }
 
-    func testLowMemorySymSpellWordSegmentationMinWordLength() throws {
+    func testLowMemorySymSpellWordSegmentationWithBigrams() throws {
         let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
 
-        // Dictionary with single-letter words that should be filtered
+        // Dictionary with words
         let dictPath = tempDir.appendingPathComponent("dict.txt")
         let dictContent = """
-        crazy 10000
-        y 5000
-        w 4000
-        a 3000
-        i 2500
-        highly 8000
-        hi 6000
-        gj 100
-        k 200
-        ahh 1000
+        the 10000000
+        quick 500000
+        brown 400000
+        fox 300000
+        w 50000
+        oah 1000
         woah 900
-        what 7000
-        is 5000
-        that 4500
-        am 3500
-        here 3000
+        what 700000
+        is 500000
+        that 450000
+        crazy 800000
+        i 600000
+        am 400000
+        here 300000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        // Bigram dictionary - only valid word pairs
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        the quick 1000000
+        quick brown 800000
+        brown fox 600000
+        what is 500000
+        is that 400000
+        i am 300000
+        am here 200000
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
+
+        // "woah" should not be segmented because "w oah" is not a valid bigram
+        let result1 = spellChecker.wordSegmentation(phrase: "woah")
+        XCTAssertFalse(result1.correctedString.contains(" "), "'woah' should not be segmented because 'w oah' is not a valid bigram")
+
+        // "thequickbrown" should segment correctly because all bigrams exist
+        let result2 = spellChecker.wordSegmentation(phrase: "thequickbrown")
+        XCTAssertEqual(result2.correctedString, "the quick brown")
+
+        // "whatisthat" should segment correctly
+        let result3 = spellChecker.wordSegmentation(phrase: "whatisthat")
+        XCTAssertEqual(result3.correctedString, "what is that")
+
+        // "crazy" alone should stay as "crazy"
+        let result4 = spellChecker.wordSegmentation(phrase: "crazy")
+        XCTAssertEqual(result4.correctedString, "crazy")
+
+        // "iamhere" should become "i am here" because valid bigrams exist
+        let result5 = spellChecker.wordSegmentation(phrase: "iamhere")
+        XCTAssertEqual(result5.correctedString, "i am here")
+
+        spellChecker.close()
+    }
+
+    func testLowMemorySymSpellWordSegmentationWithoutBigrams() throws {
+        let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
+
+        // Dictionary without bigrams
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        the 10000000
+        quick 500000
         """
         try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
 
         XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        // Note: NOT loading bigrams
 
-        // Test cases from IMPROVEMENTS.md
-        // "crazy" should stay as "crazy", not become "crazy y" due to greedy single-letter matching
-        let result1 = spellChecker.wordSegmentation(phrase: "crazy")
-        XCTAssertEqual(result1.correctedString, "crazy")
-
-        // "woahh" should not become "w ahh" - single letter "w" should be filtered
-        let result2 = spellChecker.wordSegmentation(phrase: "woahh")
-        XCTAssertFalse(result2.correctedString.hasPrefix("w "), "Should not segment 'woahh' starting with 'w '")
-
-        // "crazyy" should not become "crazy y"
-        let result3 = spellChecker.wordSegmentation(phrase: "crazyy")
-        XCTAssertFalse(result3.correctedString.hasSuffix(" y"), "Should not segment 'crazyy' ending with ' y'")
-
-        // "iamhere" should become "i am here" - "i" is an allowed single-letter word
-        let result4 = spellChecker.wordSegmentation(phrase: "iamhere")
-        XCTAssertEqual(result4.correctedString, "i am here")
-
-        // "whatisthat" should become "what is that" - valid segmentation with no single letters
-        let result5 = spellChecker.wordSegmentation(phrase: "whatisthat")
-        XCTAssertEqual(result5.correctedString, "what is that")
-
-        // Test with minWordLength = 1 (allowing all single letter words)
-        let result6 = spellChecker.wordSegmentation(phrase: "crazyy", minWordLength: 1)
-        XCTAssertEqual(result6.correctedString, "crazy y", "With minWordLength=1, 'crazyy' should become 'crazy y'")
+        // Without bigrams, should return input unchanged
+        let result = spellChecker.wordSegmentation(phrase: "thequick")
+        XCTAssertEqual(result.correctedString, "thequick", "Without bigrams loaded, input should be returned unchanged")
 
         spellChecker.close()
     }
@@ -464,9 +502,14 @@ final class LowMemorySymSpellTests: XCTestCase {
             throw XCTSkip("Dictionary file not available")
         }
 
+        guard let bigramURL = Bundle.module.url(forResource: "frequency_bigramdictionary_en_243_342", withExtension: "txt") else {
+            throw XCTSkip("Bigram dictionary not available")
+        }
+
         let spellChecker = LowMemorySymSpell(maxEditDistance: 2, prefixLength: 7, dataDir: tempDir)
 
         XCTAssertTrue(spellChecker.loadDictionary(corpus: dictURL))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramURL))
 
         // Test a simpler segmentation case
         let result = spellChecker.wordSegmentation(phrase: "thequickbrown")

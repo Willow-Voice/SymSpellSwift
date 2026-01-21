@@ -1176,21 +1176,32 @@ public class LowMemorySymSpell {
         return [SuggestItem(term: resultTerm, distance: totalDistance, count: 1)]
     }
 
-    /// Common single-letter words allowed even when minWordLength > 1
-    private static let allowedSingleLetterWords: Set<String> = ["i", "a"]
-
-    /// Word segmentation - splits concatenated words.
+    /// Word segmentation - splits concatenated words using bigram validation.
     ///
     /// Splits text like "thequickbrown" into "the quick brown".
+    /// Only segments at positions where the resulting word pair exists in the bigram dictionary.
+    /// This prevents incorrect segmentations like "woahh" → "w oahh".
+    ///
+    /// **Important:** Requires bigram dictionary to be loaded via `loadBigramDictionary()`.
+    /// Without bigrams loaded, returns the input unchanged.
     ///
     /// - Parameters:
     ///   - phrase: The concatenated text to segment
-    ///   - maxEditDistance: Maximum edit distance for spelling correction
-    ///   - minWordLength: Minimum length for segmented words (default: 2). Single-letter words like "y" or "w" won't be used in segmentation unless they're common words like "I" or "a".
+    ///   - maxEditDistance: Maximum edit distance for spelling correction (default: instance maxEditDistance)
     /// - Returns: Composition containing the segmented and corrected string
-    public func wordSegmentation(phrase: String, maxEditDistance: Int? = nil, minWordLength: Int = 2) -> Composition {
+    public func wordSegmentation(phrase: String, maxEditDistance: Int? = nil) -> Composition {
         let maxDist = maxEditDistance ?? self.maxEditDistance
         let input = phrase.lowercased().replacingOccurrences(of: " ", with: "")
+
+        // Without bigrams, we can't safely segment - return input as-is
+        guard bigramCount > 0 else {
+            return Composition(
+                segmentedString: input,
+                correctedString: input,
+                distanceSum: 0,
+                logProbSum: -50.0
+            )
+        }
 
         var resultParts: [String] = []
         var i = 0
@@ -1199,7 +1210,7 @@ public class LowMemorySymSpell {
         while i < input.count {
             var bestWord: String? = nil
             var bestLen = 0
-            var bestCount = 0
+            var bestBigramScore = 0
 
             // Try different lengths (longest first - greedy)
             for length in stride(from: min(20, input.count - i), through: 1, by: -1) {
@@ -1207,17 +1218,29 @@ public class LowMemorySymSpell {
                 let endIdx = input.index(startIdx, offsetBy: length)
                 let word = String(input[startIdx..<endIdx])
 
-                // Skip words shorter than minWordLength unless they're allowed single-letter words
-                if word.count < minWordLength && !Self.allowedSingleLetterWords.contains(word.lowercased()) {
-                    continue
-                }
-
                 let count = activeWords.get(word)
                 if count > 0 {
-                    if length > bestLen || (length == bestLen && count > bestCount) {
+                    // For first word, no bigram check needed
+                    // For subsequent words, must have valid bigram with previous word
+                    var bigramScore = 1  // Default score for first word
+                    if !resultParts.isEmpty {
+                        let bigram = "\(resultParts.last!) \(word)"
+                        bigramScore = activeBigrams.get(bigram)
+
+                        // If bigram doesn't exist, skip this candidate
+                        if bigramScore == 0 {
+                            continue
+                        }
+                    }
+
+                    // Prefer higher bigram score, then longer words
+                    let isBetter = bigramScore > bestBigramScore ||
+                        (bigramScore == bestBigramScore && length > bestLen)
+
+                    if isBetter {
                         bestWord = word
                         bestLen = length
-                        bestCount = count
+                        bestBigramScore = bigramScore
                     }
                 }
             }
@@ -1225,8 +1248,15 @@ public class LowMemorySymSpell {
             if let word = bestWord {
                 resultParts.append(word)
                 i += bestLen
+            } else if !resultParts.isEmpty {
+                // No valid bigram continuation found - append char to previous word
+                let startIdx = input.index(input.startIndex, offsetBy: i)
+                let char = String(input[startIdx])
+                resultParts[resultParts.count - 1] += char
+                totalDistance += 1
+                i += 1
             } else {
-                // Try with spelling correction
+                // No first word found - try spelling correction
                 let maxLen = min(10, input.count - i)
                 let startIdx = input.index(input.startIndex, offsetBy: i)
                 let endIdx = input.index(startIdx, offsetBy: maxLen)
@@ -1234,29 +1264,14 @@ public class LowMemorySymSpell {
 
                 let suggestions = lookup(phrase: testWord, verbosity: .top, maxEditDistance: maxDist)
 
-                // Filter suggestions by minWordLength
-                let filteredSuggestion = suggestions.first.flatMap { suggestion -> SuggestItem? in
-                    if suggestion.term.count < minWordLength && !Self.allowedSingleLetterWords.contains(suggestion.term.lowercased()) {
-                        return nil
-                    }
-                    return suggestion
-                }
-
-                if let first = filteredSuggestion, first.distance <= maxDist {
+                if let first = suggestions.first, first.distance <= maxDist {
                     resultParts.append(first.term)
                     totalDistance += first.distance
                     i += testWord.count
                 } else {
-                    // Take single character and append to previous word if exists, otherwise start accumulating
+                    // No match - take single character
                     let charIdx = input.index(input.startIndex, offsetBy: i)
-                    let char = String(input[charIdx])
-
-                    // Append unknown character to the previous word rather than creating a new single-char word
-                    if !resultParts.isEmpty {
-                        resultParts[resultParts.count - 1] += char
-                    } else {
-                        resultParts.append(char)
-                    }
+                    resultParts.append(String(input[charIdx]))
                     totalDistance += 1
                     i += 1
                 }
