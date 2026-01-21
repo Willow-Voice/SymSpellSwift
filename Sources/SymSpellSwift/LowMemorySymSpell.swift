@@ -241,6 +241,60 @@ public class MMapDictionary {
     public func contains(_ word: String) -> Bool {
         return get(word) > 0
     }
+
+    /// Find the range of indices for words starting with the given prefix.
+    ///
+    /// Uses binary search to find the first word >= prefix, then scans forward.
+    ///
+    /// - Parameters:
+    ///   - prefix: The prefix to search for
+    ///   - limit: Maximum number of results to return
+    /// - Returns: Array of (word, count) tuples sorted by count descending
+    func findWordsWithPrefix(_ prefix: String, limit: Int) -> [(word: String, count: Int)] {
+        guard data != nil, numWords > 0, !prefix.isEmpty else { return [] }
+
+        // Binary search to find first word >= prefix
+        var left = 0
+        var right = numWords - 1
+        var firstIndex = numWords
+
+        while left <= right {
+            let mid = (left + right) / 2
+            guard let (midWord, _) = getWordAtIndex(mid) else { break }
+
+            if midWord < prefix {
+                left = mid + 1
+            } else {
+                firstIndex = mid
+                right = mid - 1
+            }
+        }
+
+        // Collect words starting with prefix
+        var results: [(word: String, count: Int)] = []
+        var idx = firstIndex
+
+        while idx < numWords {
+            guard let (word, count) = getWordAtIndex(idx) else { break }
+
+            // Check if word still starts with prefix
+            if !word.hasPrefix(prefix) {
+                break
+            }
+
+            results.append((word, count))
+            idx += 1
+
+            // Collect more than limit to allow sorting by frequency
+            if results.count >= limit * 10 {
+                break
+            }
+        }
+
+        // Sort by count descending and return top results
+        results.sort { $0.count > $1.count }
+        return Array(results.prefix(limit))
+    }
 }
 
 // MARK: - MMapDeletes
@@ -968,6 +1022,120 @@ public class LowMemorySymSpell {
         }
 
         return suggestions
+    }
+
+    // MARK: - Prefix Completion
+
+    /// Find words that start with the given prefix, sorted by frequency.
+    ///
+    /// Use this as a fallback when `lookup()` returns no spelling corrections.
+    ///
+    /// - Parameters:
+    ///   - prefix: The prefix to search for
+    ///   - limit: Maximum number of results to return (default: 5)
+    /// - Returns: Array of SuggestItem with distance 0, sorted by frequency (highest first)
+    ///
+    /// Example:
+    /// ```swift
+    /// let completions = symSpell.prefixLookup(prefix: "hel", limit: 3)
+    /// // Returns: ["hello", "help", "helmet", ...] sorted by frequency
+    /// ```
+    public func prefixLookup(prefix: String, limit: Int = 5) -> [SuggestItem] {
+        let lowercasePrefix = prefix.lowercased()
+
+        guard !lowercasePrefix.isEmpty else { return [] }
+
+        let matches = activeWords.findWordsWithPrefix(lowercasePrefix, limit: limit)
+
+        return matches.map { word, count in
+            SuggestItem(term: word, distance: 0, count: count)
+        }
+    }
+
+    // MARK: - Confidence-Based Auto-Correction
+
+    /// Get a spelling correction with confidence score for auto-replacement decisions.
+    ///
+    /// Confidence factors in:
+    /// - **Edit distance**: Lower distance = higher confidence
+    /// - **Frequency ratio**: Clear winner among suggestions = higher confidence
+    /// - **Word length**: Short words (< 4 chars) are penalized as they're riskier
+    /// - **Ambiguity**: Similar frequencies among top suggestions = lower confidence
+    ///
+    /// - Parameters:
+    ///   - word: The word to check for correction
+    ///   - minConfidence: Minimum confidence threshold (default: 0.75)
+    /// - Returns: Tuple of (corrected term, confidence score), or nil if no confident correction
+    ///
+    /// Returns nil if:
+    /// - Input is already a valid dictionary word
+    /// - No suggestions found
+    /// - Confidence is below minConfidence
+    ///
+    /// Example:
+    /// ```swift
+    /// if let (correction, confidence) = symSpell.autoCorrection(for: "teh", minConfidence: 0.8) {
+    ///     // Replace "teh" with correction (likely "the")
+    /// }
+    /// ```
+    public func autoCorrection(for word: String, minConfidence: Double = 0.75) -> (term: String, confidence: Double)? {
+        let lowercaseWord = word.lowercased()
+
+        // Return nil if word is already valid
+        if activeWords.get(lowercaseWord) > 0 {
+            return nil
+        }
+
+        // Get suggestions with all verbosity to assess ambiguity
+        let suggestions = lookup(phrase: lowercaseWord, verbosity: .all, maxEditDistance: maxEditDistance)
+
+        guard let top = suggestions.first else {
+            return nil  // No suggestions found
+        }
+
+        // Calculate confidence score
+        var confidence = 1.0
+
+        // Factor 1: Edit distance penalty (0.0 to 0.4 penalty)
+        // Distance 1 = 0.15 penalty, Distance 2 = 0.4 penalty
+        let distancePenalty = Double(top.distance) * 0.2
+        confidence -= distancePenalty
+
+        // Factor 2: Frequency ratio / ambiguity (0.0 to 0.3 penalty)
+        // If second-best suggestion has similar frequency, reduce confidence
+        let sameDistanceSuggestions = suggestions.filter { $0.distance == top.distance }
+        if sameDistanceSuggestions.count > 1, let second = sameDistanceSuggestions.dropFirst().first {
+            let totalCount = Double(top.count + second.count)
+            if totalCount > 0 {
+                let ratio = Double(top.count) / totalCount
+                // ratio of 0.5 (equal) = 0.3 penalty, ratio of 1.0 (clear winner) = 0 penalty
+                let ambiguityPenalty = (1.0 - ratio) * 0.6
+                confidence -= ambiguityPenalty
+            }
+        }
+
+        // Factor 3: Short word penalty (0.0 to 0.2 penalty)
+        // Words < 4 chars are riskier to auto-correct
+        if lowercaseWord.count < 4 {
+            let shortWordPenalty = Double(4 - lowercaseWord.count) * 0.07
+            confidence -= shortWordPenalty
+        }
+
+        // Factor 4: Bonus for very high frequency words
+        // If top suggestion is very common, boost confidence slightly
+        if top.count > 100000 {
+            confidence += 0.05
+        }
+
+        // Clamp confidence to [0, 1]
+        confidence = max(0.0, min(1.0, confidence))
+
+        // Return nil if below threshold
+        guard confidence >= minConfidence else {
+            return nil
+        }
+
+        return (top.term, confidence)
     }
 
     /// Compound word correction for multi-word phrases.
