@@ -352,18 +352,22 @@ public class SymSpell {
         return [suggestion]
     }
 
+    /// Common single-letter words allowed even when minWordLength > 1
+    private static let allowedSingleLetterWords: Set<String> = ["i", "a"]
+
     /// Divides a string into words by inserting missing spaces at the appropriate positions.
     /// Misspelled words are corrected and do not affect segmentation, existing spaces are allowed and considered for optimum segmentation.
     /// - Parameters:
-    ///   - input:
-    ///   - maxEditDistance:
+    ///   - input: The text to segment
+    ///   - maxEditDistance: Maximum edit distance for spelling correction
+    ///   - minWordLength: Minimum length for segmented words (default: 2). Single-letter words like "y" or "w" won't be used in segmentation unless they're common words like "I" or "a".
     /// - Returns: A `Segmentation` struct, containing:
     ///    - the segmented string,
     ///    - the segmented and spelling corrected string,
     ///    - the Edit distance sum between input string and corrected string,
     ///    - the Sum of word occurence probabilities in log scale (a measure of how common and probable the corrected segmentation is).
 
-    public func wordSegmentation(_ input: String, maxEditDistance: Int = 0) -> Segmentation {
+    public func wordSegmentation(_ input: String, maxEditDistance: Int = 0, minWordLength: Int = 2) -> Segmentation {
         // Normalize ligatures and replace hyphens
         let input = input.precomposedStringWithCompatibilityMapping.replacingOccurrences(of: "\u{002D}", with: "")
 
@@ -377,7 +381,7 @@ public class SymSpell {
 
             for i in 1 ... min(input.count - j, maxDictionaryWordLength) {
                 guard var partSubstr = input[j ..< j + i] else { continue }
-                
+
                 var separatorLength = 0
                 var topEd = 0
                 var topProbabilityLog = 0.0
@@ -396,9 +400,23 @@ public class SymSpell {
                 let part = partSubstr.replacingOccurrences(of: " ", with: "")
                 topEd -= part.count
 
+                // Skip parts shorter than minWordLength unless they are allowed single-letter words
+                // This prevents segmentation like "crazy y" when minWordLength > 1
+                if part.count < minWordLength && !Self.allowedSingleLetterWords.contains(part.lowercased()) {
+                    continue
+                }
+
                 let results = lookup(part.lowercased(), verbosity: .top, maxEditDistance: maxEditDistance)
-                
-                if let result = results.first {
+
+                // Filter results by minWordLength - reject words shorter than minimum unless they're allowed single-letter words
+                let filteredResult = results.first.flatMap { result -> SuggestItem? in
+                    if result.term.count < minWordLength && !Self.allowedSingleLetterWords.contains(result.term.lowercased()) {
+                        return nil
+                    }
+                    return result
+                }
+
+                if let result = filteredResult {
                     topResult = result.term
                     if part.first?.isUppercase == true {
                         topResult = topResult.prefix(1).uppercased() + topResult.dropFirst()
