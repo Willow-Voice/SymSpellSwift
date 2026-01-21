@@ -4,7 +4,7 @@ Planned enhancements for the SymSpellSwift library.
 
 ---
 
-## 1. Word Segmentation: Minimum Word Length
+## 1. Word Segmentation: Bigram-Based Validation ✅ IMPLEMENTED
 
 **Problem:**
 Word segmentation produces incorrect results with single-letter words:
@@ -13,33 +13,166 @@ Word segmentation produces incorrect results with single-letter words:
 - `"crazyy"` → `"crazy y"` (incorrect)
 - `"highlyyy"` (mistyped "highly") → `"hi gj k y"` (completely wrong)
 
-Single-letter dictionary words like "y", "w", "a" are being used in segmentation when they shouldn't be.
+**Solution Implemented:**
+Word segmentation now **requires** the bigram dictionary to be loaded. Segmentation only occurs at positions where the resulting word pair exists in the bigram dictionary.
+
+```swift
+// Load both dictionaries
+spellChecker.loadDictionary(corpus: dictURL)
+spellChecker.loadBigramDictionary(corpus: bigramURL)  // Required!
+
+// Segmentation only where valid bigrams exist
+spellChecker.wordSegmentation(phrase: "thequickbrown")  // → "the quick brown"
+spellChecker.wordSegmentation(phrase: "woahhhh")        // → "woahhhh" (unchanged - no valid bigrams)
+spellChecker.wordSegmentation(phrase: "crazyy")         // → "crazyy" (unchanged)
+```
+
+**Behavior:**
+- Without bigrams loaded: Returns input unchanged
+- With bigrams: Only segments where consecutive word pairs exist in bigram dictionary
+- Prevents all incorrect single-letter segmentations
+
+---
+
+## 2. Correction-Aware Segmentation (Beam Search)
+
+**Problem:**
+Current segmentation requires input words to be correctly spelled OR uses spelling correction only as a fallback. This fails for concatenated misspelled words:
+
+- `"tahtswhat"` → should become `"that's what"` (but doesn't)
+- `"thayswhat"` → should become `"that's what"` (but doesn't)
+- `"helloworlf"` → should become `"hello world"` (but doesn't)
+
+The current greedy algorithm:
+1. Looks for exact dictionary matches first
+2. Only spell-corrects when no match found
+3. Can't explore multiple segmentation hypotheses
 
 **Solution:**
-Add a `minWordLength` parameter to `wordSegmentation()`:
+Use **beam search** to explore multiple segmentation + correction hypotheses simultaneously:
 
 ```swift
 func wordSegmentation(
     phrase: String,
     maxEditDistance: Int = 2,
-    minWordLength: Int = 2  // NEW: minimum length for segmented words
-) -> SegmentedEntry
+    beamWidth: Int = 10  // Number of hypotheses to track
+) -> Composition
+```
+
+**Algorithm:**
+
+```
+Input: "tahtswhat"
+
+Beam at position 0:
+  Try segment lengths 1-10, get spelling corrections for each:
+  - "t" → corrections: ["t"(d=0)] - too short, skip
+  - "ta" → corrections: ["ta"(d=0), "to"(d=1)...]
+  - "tah" → corrections: ["the"(d=2), "tan"(d=2)...]
+  - "taht" → corrections: ["that"(d=1), "tart"(d=2)...]
+  - "tahts" → corrections: ["that's"(d=1), "thats"(d=1)...]  ← promising!
+
+  Score each by: bigram_probability - edit_distance_penalty
+  Keep top-10 hypotheses
+
+Beam after "tahts"→"that's" (position 5):
+  Remaining: "what"
+  - "what" → corrections: ["what"(d=0)]
+  - Bigram "that's what" exists with high frequency
+
+  Final: "that's what" with score = bigram_score - 1 (edit distance)
+```
+
+**Scoring Function:**
+```swift
+struct SegmentationHypothesis {
+    let words: [String]           // Corrected words so far
+    let position: Int             // Current position in input
+    let totalEditDistance: Int    // Sum of edit distances
+    let bigramLogProb: Double     // Sum of log(bigram frequencies)
+
+    var score: Double {
+        // Balance: prefer common phrases, penalize corrections
+        let editPenalty = Double(totalEditDistance) * 2.0
+        return bigramLogProb - editPenalty
+    }
+}
 ```
 
 **Implementation Notes:**
-- Default `minWordLength` to 2
-- Allow exceptions for common single-letter words: "I", "a" (and possibly "O" as interjection)
-- Filter candidate segmentations that contain words shorter than the minimum
-- Consider adding a parameter for custom allowed single-letter words
 
-**Example Behavior After Fix:**
-- `"crazyy"` → `"crazy"` (single word correction, not segmentation)
-- `"whatsthat"` → `"what's that"` (valid segmentation)
-- `"iamhere"` → `"I am here"` (valid, "I" is allowed exception)
+1. **At each position, generate candidates:**
+   ```swift
+   for length in 1...min(maxWordLength, remaining.count) {
+       let segment = input[position..<position+length]
+       let corrections = lookup(segment, verbosity: .closest, maxEditDistance: 2)
+
+       for correction in corrections.prefix(3) {
+           // Check bigram with previous word
+           if let prev = hypothesis.words.last {
+               guard bigrams["\(prev) \(correction.term)"] != nil else { continue }
+           }
+           // Add new hypothesis
+       }
+   }
+   ```
+
+2. **Prune beam after each position:**
+   - Sort hypotheses by score
+   - Keep only top `beamWidth` candidates
+   - Discard low-scoring paths early
+
+3. **Handle contractions:**
+   - Include contractions in dictionary ("that's", "don't", "won't")
+   - Include bigrams with contractions ("that's what", "don't know")
+
+4. **Fallback behavior:**
+   - If no valid segmentation found, return best partial result
+   - Or return input unchanged (current behavior)
+
+**Example Behavior After Implementation:**
+```
+Input: "tahtswhat"
+  Hypotheses explored:
+    "that what" (d=2, no bigram for "that what") → rejected
+    "that's what" (d=1, bigram exists!) → score: 15.2
+    "tarts what" (d=2, no bigram) → rejected
+
+  Result: "that's what"
+
+Input: "thayswhat"
+  "thays" → "that's" (d=2, 'ay'→'at' + add apostrophe)
+  "what" → "what" (d=0)
+  Bigram "that's what" exists
+
+  Result: "that's what"
+
+Input: "helloworlf"
+  "hello" → "hello" (d=0)
+  "worlf" → "world" (d=1)
+  Bigram "hello world" exists
+
+  Result: "hello world"
+```
+
+**Performance Considerations:**
+- Beam width of 10 keeps search tractable
+- Early pruning prevents exponential blowup
+- Limit correction candidates to top-3 per segment
+- Cache bigram lookups
+
+**Comparison with Apple's Approach:**
+Apple's keyboard likely uses:
+- Neural language models (we use bigram frequencies)
+- Keyboard proximity weighting (see Section 3)
+- User history/context (out of scope)
+- Device-optimized inference (we use simpler beam search)
+
+This beam search approach provides ~80% of the benefit with much simpler implementation.
 
 ---
 
-## 2. Spatial Keyboard Error Weighting
+## 3. Spatial Keyboard Error Weighting ✅ IMPLEMENTED
 
 **Problem:**
 Standard edit distance treats all character substitutions equally, but keyboard typos often involve adjacent keys:
@@ -48,74 +181,65 @@ Standard edit distance treats all character substitutions equally, but keyboard 
 
 A user typing "thr" meaning "the" should rank higher than "thr" → "tar" even though both are 1 substitution.
 
-**Solution:**
-Pass keyboard layout during SymSpell initialization. The library handles all layout-specific logic internally.
+**Solution Implemented:**
+Pass keyboard layout during SymSpell initialization. The library handles all layout-specific logic internally using pre-computed binary distance matrices.
 
 ```swift
-// Keyboard layouts handled by SymSpell
-public enum KeyboardLayout {
-    case qwerty          // Standard US/UK layout
-    case qwertyMobile    // Mobile QWERTY (different adjacencies due to key size)
-    case azerty          // French layout
-    case qwertz          // German layout
-    case dvorak          // Dvorak layout
-    case colemak         // Colemak layout
-    case none            // Disable spatial weighting (default, current behavior)
-}
-
 // Initialize with keyboard layout
 let symSpell = LowMemorySymSpell(
     maxEditDistance: 2,
     prefixLength: 7,
-    keyboardLayout: .qwertyMobile  // NEW parameter
+    keyboardLayout: .qwerty
 )
+
+// Load keyboard layout binary file
+symSpell.loadKeyboardLayout(from: keyboardLayoutDirectory)
+
+// Load dictionary
+symSpell.loadPrebuilt(from: dataDirectory)
+
+// "tje" will now prefer "the" (j→h adjacent) over "tie"
+let suggestions = symSpell.lookup(phrase: "tje", verbosity: .closest)
 ```
 
-**Implementation Notes:**
+**Supported Layouts:**
+- `.qwerty` - Standard US/UK layout
+- `.azerty` - French layout
+- `.qwertz` - German layout
+- `.dvorak` - Dvorak layout
+- `.colemak` - Colemak layout
+- `.none` - Disable spatial weighting (default)
 
-1. **Library owns all adjacency maps internally:**
-   ```swift
-   // Internal to SymSpell - not exposed to consumers
-   internal struct KeyboardAdjacency {
-       static let qwerty: [Character: Set<Character>] = [
-           "q": ["w", "a"],
-           "w": ["q", "e", "a", "s"],
-           "e": ["w", "r", "s", "d"],
-           "t": ["r", "y", "f", "g"],
-           // ... etc
-       ]
+**Implementation Details:**
 
-       static let qwertyMobile: [Character: Set<Character>] = [
-           // Slightly different - larger touch targets mean different error patterns
-       ]
+1. **Pre-computed distance matrices:**
+   - Keyboard layouts stored as compact binary files (681 bytes each)
+   - 26x26 distance matrix for lowercase letters
+   - Generated via `scripts/generate_keyboard_layout.py`
 
-       static func adjacency(for layout: KeyboardLayout) -> [Character: Set<Character>]
-   }
-   ```
-
-2. **Modify distance calculation:**
+2. **Weighted edit distance:**
    - Adjacent key substitution: 0.5 cost (instead of 1.0)
+   - Distance-2 substitution: 0.75 cost
    - Non-adjacent substitution: 1.0 cost
-   - This allows `maxEditDistance: 2` to catch up to 4 adjacent-key errors
+   - Allows `maxEditDistance: 2` to catch up to 4 adjacent-key errors
 
-3. **Support fractional distances in lookup:**
-   - Internal distance calculations use `Double`
-   - Results filtered by `maxEditDistance` still work correctly
-
-4. **Default behavior unchanged:**
-   - `keyboardLayout: .none` preserves current behavior (no spatial weighting)
+3. **Default behavior unchanged:**
+   - `keyboardLayout: .none` preserves current behavior
    - Existing code continues to work without modification
 
-**Example Behavior After Fix:**
+**Example Behavior:**
 ```
 Input: "tje" (meant "the", j is adjacent to h)
 Before: "the" distance=1, "tie" distance=1 (equal ranking)
 After:  "the" distance=0.5 (adjacent j→h), "tie" distance=1.0 (non-adjacent)
+
+Input: "thr" (meant "the", r is adjacent to e)
+Result: "the" with weighted distance 0.5 (r→e adjacent)
 ```
 
 ---
 
-## 3. Improved Frequency Weighting in Ranking
+## 4. Improved Frequency Weighting in Ranking (Future)
 
 **Problem:**
 Currently, SymSpell ranks suggestions by:
@@ -199,7 +323,7 @@ Input: "speling"
 
 ---
 
-## 4. Future Considerations
+## 5. Future Considerations
 
 ### Confidence Score API
 Expose confidence calculations directly from the library:
@@ -229,9 +353,10 @@ Optional phonetic similarity for suggestions:
 
 ## Priority
 
-1. **High**: Word Segmentation Min Length - Causes visible bugs (e.g., "highlyyy" → "hi gj k y")
-2. **High**: Spatial Keyboard Weighting - Significant UX improvement for typos
-3. **High**: Improved Frequency Weighting - Common words should rank higher
-4. **Medium**: Confidence Score API - Cleaner integration
-5. **Low**: Custom Dictionary Tiers - Nice to have
-6. **Low**: Phonetic Matching - Complex implementation
+1. ✅ **DONE**: Word Segmentation Bigram Validation - Prevents incorrect segmentations
+2. ✅ **DONE**: Spatial Keyboard Weighting - Significant UX improvement for typos
+3. **High**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
+4. **Medium**: Improved Frequency Weighting - Common words should rank higher
+5. **Medium**: Confidence Score API - Cleaner integration
+6. **Low**: Custom Dictionary Tiers - Nice to have
+7. **Low**: Phonetic Matching - Complex implementation

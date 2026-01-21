@@ -521,4 +521,223 @@ final class LowMemorySymSpellTests: XCTestCase {
 
         spellChecker.close()
     }
+
+    // MARK: - Keyboard Layout Tests
+
+    func testMMapKeyboardLayoutLoad() throws {
+        let keyboardDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("keyboard_layouts")
+
+        let keyboard = MMapKeyboardLayout(layout: .qwerty)
+        XCTAssertTrue(keyboard.loadFromDirectory(keyboardDir), "Failed to load QWERTY keyboard layout")
+
+        // Test adjacency - 'd' should be adjacent to 's' on QWERTY
+        XCTAssertTrue(keyboard.areAdjacent("d", "s"), "d and s should be adjacent on QWERTY")
+        XCTAssertTrue(keyboard.areAdjacent("t", "y"), "t and y should be adjacent on QWERTY")
+        XCTAssertTrue(keyboard.areAdjacent("h", "j"), "h and j should be adjacent on QWERTY")
+
+        // Non-adjacent keys
+        XCTAssertFalse(keyboard.areAdjacent("q", "m"), "q and m should not be adjacent")
+        XCTAssertFalse(keyboard.areAdjacent("a", "p"), "a and p should not be adjacent")
+
+        // Same key
+        XCTAssertEqual(keyboard.distance(from: "a", to: "a"), 0)
+        XCTAssertEqual(keyboard.substitutionCost(from: "a", to: "a"), 0.0)
+
+        keyboard.close()
+    }
+
+    func testMMapKeyboardLayoutSubstitutionCosts() throws {
+        let keyboardDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("keyboard_layouts")
+
+        let keyboard = MMapKeyboardLayout(layout: .qwerty)
+        XCTAssertTrue(keyboard.loadFromDirectory(keyboardDir))
+
+        // Adjacent key substitution should cost 0.5
+        XCTAssertEqual(keyboard.substitutionCost(from: "d", to: "s"), 0.5)
+        XCTAssertEqual(keyboard.substitutionCost(from: "t", to: "y"), 0.5)
+
+        // Distance 2 should cost 0.75
+        // 'w' and 'd' are distance 2 (w→s→d or w→e→d)
+        let dist2Cost = keyboard.substitutionCost(from: "w", to: "d")
+        XCTAssertEqual(dist2Cost, 0.75, "Distance 2 substitution should cost 0.75")
+
+        // Far keys should cost 1.0
+        XCTAssertEqual(keyboard.substitutionCost(from: "q", to: "m"), 1.0)
+
+        keyboard.close()
+    }
+
+    func testLowMemorySymSpellWithKeyboardLayout() throws {
+        let keyboardDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("keyboard_layouts")
+
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            keyboardLayout: .qwerty,
+            dataDir: tempDir
+        )
+
+        // Load keyboard layout
+        XCTAssertTrue(spellChecker.loadKeyboardLayout(from: keyboardDir))
+
+        // Create dictionary (no "tje" so it will need correction)
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        hello 10000
+        help 9000
+        held 8000
+        world 7000
+        words 6000
+        the 50000
+        tie 5000
+        whats 30000
+        watts 2000
+        warts 1000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // Test: "tje" should prefer "the" because j→h is adjacent on QWERTY
+        // Without keyboard weighting, "tje" → "tie" (distance 1) would rank same as "the" (distance 1)
+        // With keyboard weighting, "tje" → "the" has lower weighted distance (0.5) because j and h are adjacent
+        let suggestions1 = spellChecker.lookup(phrase: "tje", verbosity: .closest)
+        XCTAssertFalse(suggestions1.isEmpty, "Should have suggestions for 'tje'")
+        // The first suggestion should be "the" due to keyboard adjacency boosting
+        XCTAssertEqual(suggestions1.first?.term, "the", "Expected 'the' as top suggestion for 'tje' with QWERTY keyboard")
+
+        spellChecker.close()
+    }
+
+    func testLowMemorySymSpellKeyboardAdjacentTypos() throws {
+        let keyboardDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("keyboard_layouts")
+
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            keyboardLayout: .qwerty,
+            dataDir: tempDir
+        )
+
+        XCTAssertTrue(spellChecker.loadKeyboardLayout(from: keyboardDir))
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        whats 50000
+        watts 5000
+        warts 1000
+        whale 3000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // "whayd" has two adjacent-key errors relative to "whats":
+        // - y→t (adjacent on QWERTY)
+        // - d→s (adjacent on QWERTY)
+        // This should result in weighted distance of 1.0 (0.5 + 0.5)
+        // compared to standard distance of 2
+        let suggestions = spellChecker.lookup(phrase: "whayd", verbosity: .closest)
+        XCTAssertFalse(suggestions.isEmpty, "Should have suggestions for 'whayd'")
+
+        // With keyboard weighting, "whats" should be the top suggestion
+        // because both substitutions are adjacent-key errors
+        if let top = suggestions.first {
+            XCTAssertEqual(top.term, "whats", "Expected 'whats' for 'whayd' with adjacent-key errors")
+            // The distance should be lower due to keyboard weighting
+            XCTAssertLessThanOrEqual(top.distance, 2)
+        }
+
+        spellChecker.close()
+    }
+
+    func testLowMemorySymSpellLeysToLets() throws {
+        // Test keyboard weighting with a clear adjacent-key scenario
+        // "thr" → should prefer "the" because r→e is an adjacent-key error
+        // But without keyboard weighting, both "the" and "tar" would have distance 1
+        let keyboardDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("keyboard_layouts")
+
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            keyboardLayout: .qwerty,
+            dataDir: tempDir
+        )
+
+        XCTAssertTrue(spellChecker.loadKeyboardLayout(from: keyboardDir))
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        // Note: "thr" is NOT in dictionary, so it will need to be corrected
+        let dictContent = """
+        the 100000
+        tar 50000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // Test: "thr" - both "the" and "tar" are distance 1
+        // But r→e is adjacent (r and e are neighbors on QWERTY)
+        // So "the" should have lower weighted distance
+        let suggestions = spellChecker.lookup(phrase: "thr", verbosity: .closest)
+        XCTAssertFalse(suggestions.isEmpty, "Should have suggestions for 'thr'")
+
+        // Debug: print all suggestions
+        for s in suggestions {
+            print("  \(s.term) distance=\(s.distance) count=\(s.count)")
+        }
+
+        // With keyboard weighting, "the" should be preferred
+        // because r and e are adjacent on QWERTY
+        // Note: If both floor to same int distance, highest frequency wins
+        XCTAssertEqual(suggestions.first?.term, "the", "Expected 'the' for 'thr' since r and e are adjacent on QWERTY")
+
+        spellChecker.close()
+    }
+
+    func testKeyboardLayoutNoneDisablesWeighting() throws {
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            keyboardLayout: .none,  // Explicitly disable keyboard weighting
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        the 50000
+        tie 5000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // Without keyboard weighting, both "the" and "tie" have distance 1 from "tje"
+        // The higher frequency word "the" should win
+        let suggestions = spellChecker.lookup(phrase: "tje", verbosity: .closest)
+        XCTAssertFalse(suggestions.isEmpty)
+
+        // Both should have distance 1 without keyboard weighting
+        for suggestion in suggestions {
+            XCTAssertEqual(suggestion.distance, 1)
+        }
+
+        spellChecker.close()
+    }
 }

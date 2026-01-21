@@ -219,6 +219,96 @@ of the 29432
 in the 23567
 ```
 
+## Spatial Keyboard Error Weighting
+
+SymSpellSwift supports keyboard-aware spell correction that gives preference to corrections involving adjacent keys. This improves correction accuracy for common typing errors where users hit a neighboring key.
+
+### How It Works
+
+- Adjacent key substitutions (e.g., 'h' and 'j' on QWERTY) cost 0.5 instead of 1.0
+- Distance-2 key substitutions cost 0.75
+- This allows the spell checker to better identify intended words
+
+**Example:** For input "tje" (meaning "the"):
+- Without keyboard weighting: "the" and "tie" both have distance 1
+- With QWERTY weighting: "the" has distance 0.5 (j→h adjacent), "tie" has distance 1.0
+
+### Usage
+
+```swift
+// Initialize with keyboard layout
+let spellChecker = LowMemorySymSpell(
+    maxEditDistance: 2,
+    prefixLength: 7,
+    keyboardLayout: .qwerty
+)
+
+// Load keyboard layout binary file
+if let keyboardDir = Bundle.main.resourceURL?.appendingPathComponent("keyboard_layouts") {
+    spellChecker.loadKeyboardLayout(from: keyboardDir)
+}
+
+// Load dictionary
+spellChecker.loadPrebuilt(from: dataDir)
+
+// "tje" will now prefer "the" over "tie"
+let suggestions = spellChecker.lookup(phrase: "tje", verbosity: .closest)
+```
+
+### Supported Layouts
+
+| Layout | Enum Value | Description |
+|--------|------------|-------------|
+| QWERTY | `.qwerty` | Standard US/UK layout |
+| AZERTY | `.azerty` | French layout |
+| QWERTZ | `.qwertz` | German layout |
+| Dvorak | `.dvorak` | Dvorak layout |
+| Colemak | `.colemak` | Colemak layout |
+| None | `.none` | Disable spatial weighting (default) |
+
+### Generating Keyboard Layout Files
+
+Pre-built keyboard layout files are included in `keyboard_layouts/`. To regenerate or add new layouts:
+
+```bash
+# Generate all layouts
+python scripts/generate_keyboard_layout.py --output ./keyboard_layouts
+
+# Generate specific layout
+python scripts/generate_keyboard_layout.py --layout qwerty --output ./keyboard_layouts
+
+# Show adjacency information (for debugging)
+python scripts/generate_keyboard_layout.py --layout qwerty --verbose
+```
+
+### Adding Custom Layouts
+
+To add a new keyboard layout:
+
+1. Edit `scripts/generate_keyboard_layout.py`
+2. Add your layout rows to the `LAYOUTS` dictionary:
+   ```python
+   MY_LAYOUT_ROWS = [
+       list("qwertyuiop"),  # Top row
+       list("asdfghjkl"),   # Middle row
+       list("zxcvbnm"),     # Bottom row
+   ]
+
+   LAYOUTS["mylayout"] = MY_LAYOUT_ROWS
+   ```
+3. Run the script to generate the binary file
+4. Add the corresponding enum case in `KeyboardLayout.swift`
+
+### Binary Format
+
+Keyboard layout files use a compact binary format (681 bytes):
+- Header: 4 bytes magic ("KYBD") + 1 byte version
+- Distance matrix: 26x26 bytes for lowercase letters a-z
+  - 0 = same key
+  - 1 = adjacent (ring 1)
+  - 2 = distance 2 (ring 2)
+  - 255 = far away
+
 ## Interactive TUI
 
 A terminal UI is included for testing the spell checker:

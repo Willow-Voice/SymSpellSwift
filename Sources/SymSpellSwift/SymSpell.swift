@@ -15,14 +15,14 @@ public class SymSpell {
     public enum Verbosity: CaseIterable {
         case top, closest, all
     }
-    
+
     public struct Segmentation {
         public var segmentedString = ""
         public var correctedString = ""
         public var distanceSum = 0
         public var probabilityLogSum = 0.0
     }
-    
+
     public var wordCount: Int { words.count }
     public var entryCount: Int { deletes.count }
 
@@ -30,6 +30,8 @@ public class SymSpell {
     private(set) var maxDictionaryEditDistance = 2
     /// Length of prefix, from which deletes are generated.
     private(set) var prefixLength = 7
+    /// Keyboard layout for spatial error weighting.
+    public let keyboardLayout: KeyboardLayout
 
     private var deletes = [Int: [Int]]()
     private var words = [Int: (String, Int)]()
@@ -42,16 +44,65 @@ public class SymSpell {
     private var maxDictionaryWordLength: Int = 0
     private var totalCorpusWords = 0
 
-    /// Create a new instanc of SymSpell.
+    // Keyboard layout for spatial weighting
+    private var keyboard: MMapKeyboardLayout?
+
+    /// Create a new instance of SymSpell.
     /// - Parameters:
     ///   - maxDictionaryEditDistance: Maximum edit distance for doing lookups.
     ///   - prefixLength: The length of word prefixes used for spell checking.
-    public init(maxDictionaryEditDistance: Int = 2, prefixLength: Int = 7) {
+    ///   - keyboardLayout: Keyboard layout for spatial error weighting (default: .none).
+    public init(maxDictionaryEditDistance: Int = 2, prefixLength: Int = 7, keyboardLayout: KeyboardLayout = .none) {
         precondition(maxDictionaryEditDistance >= 0, "maxDictionaryEditDistance must be non-negative")
         precondition(prefixLength > 1 && prefixLength > maxDictionaryEditDistance, "Invalid prefixLength")
 
         self.maxDictionaryEditDistance = maxDictionaryEditDistance
         self.prefixLength = prefixLength
+        self.keyboardLayout = keyboardLayout
+
+        // Initialize keyboard layout if specified
+        if keyboardLayout != .none {
+            self.keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
+    }
+
+    /// Load keyboard layout from a directory containing layout files.
+    ///
+    /// The directory should contain files like `keyboard_qwerty.bin`, `keyboard_azerty.bin`, etc.
+    /// The appropriate file is selected based on the `keyboardLayout` set during initialization.
+    ///
+    /// - Parameter directory: Directory containing keyboard layout .bin files
+    /// - Returns: true if keyboard layout was loaded successfully
+    @discardableResult
+    public func loadKeyboardLayout(from directory: URL) -> Bool {
+        guard keyboardLayout != .none else { return true }
+
+        if keyboard == nil {
+            keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
+
+        return keyboard?.loadFromDirectory(directory) ?? false
+    }
+
+    /// Load keyboard layout from a specific file.
+    ///
+    /// - Parameter path: Path to the keyboard layout .bin file
+    /// - Returns: true if keyboard layout was loaded successfully
+    @discardableResult
+    public func loadKeyboardLayoutFile(from path: URL) -> Bool {
+        guard keyboardLayout != .none else { return true }
+
+        if keyboard == nil {
+            keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
+
+        return keyboard?.load(from: path) ?? false
+    }
+
+    /// Check if keyboard layout is loaded and active.
+    public var isKeyboardLayoutLoaded: Bool {
+        guard keyboardLayout != .none else { return false }
+        return keyboard != nil
     }
 
     /// Load multiple dictionary entries from a file of word/frequency count pairs.
@@ -188,7 +239,7 @@ public class SymSpell {
                 } else {
                     if verbosity != .all && !deleteInSuggestionPrefix(candidate, candidateLen, suggestion, suggestionLen) ||
                         !consideredSuggestions.insert(suggestion).inserted { continue }
-                    distance = input.distanceDamerauLevenshtein(between: suggestion)
+                    distance = editDistance(input, suggestion, maxEditDistance2)
                 }
 
                 if distance <= maxEditDistance2 {
@@ -291,7 +342,7 @@ public class SymSpell {
 
                             if !suggestions2.isEmpty {
                                 suggestionSplit.term = suggestions1[0].term + " " + suggestions2[0].term
-                                var distance2 = termList[i].distanceDamerauLevenshtein(between: suggestionSplit.term)
+                                var distance2 = editDistance(termList[i], suggestionSplit.term, maxEditDistance)
                                 if distance2 < 0 { distance2 = maxEditDistance + 1 }
 
                                 if let best = suggestionSplitBest {
@@ -347,7 +398,7 @@ public class SymSpell {
 
         suggestion.count = Int(count)
         suggestion.term = s.trimmingCharacters(in: .whitespaces)
-        suggestion.distance = input.distanceDamerauLevenshtein(between: suggestion.term)
+        suggestion.distance = editDistance(input, suggestion.term, maxEditDistance)
 
         return [suggestion]
     }
@@ -556,6 +607,29 @@ public class SymSpell {
                 edits(delete, editDistance, &deleteWords)
             }
         }
+    }
+
+    /// Calculate edit distance with optional keyboard weighting.
+    ///
+    /// - Parameters:
+    ///   - s1: First string
+    ///   - s2: Second string
+    ///   - maxDistance: Maximum distance to calculate
+    /// - Returns: Edit distance, or max distance + 1 if exceeds maxDistance
+    private func editDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Int {
+        // Use keyboard-weighted distance if available
+        if let keyboard = keyboard, keyboard.keyboardLayout != .none {
+            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+            if weightedDist < 0 {
+                return maxDistance + 1
+            }
+            // Floor the weighted distance to int for compatibility with existing sorting
+            return Int(weightedDist)
+        }
+
+        // Use standard distance
+        let distance = s1.distanceDamerauLevenshtein(between: s2)
+        return distance > maxDistance ? maxDistance + 1 : distance
     }
 }
 

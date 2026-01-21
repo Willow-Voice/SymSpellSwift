@@ -521,11 +521,24 @@ public class MMapDeletes {
 /// // Lookup suggestions
 /// let suggestions = spellChecker.lookup(phrase: "helo", verbosity: .top)
 /// ```
+///
+/// For keyboard-aware spell checking with spatial error weighting:
+/// ```swift
+/// let spellChecker = LowMemorySymSpell(
+///     maxEditDistance: 2,
+///     prefixLength: 7,
+///     keyboardLayout: .qwerty
+/// )
+/// // Load keyboard layout from directory containing keyboard_qwerty.bin
+/// spellChecker.loadKeyboardLayout(from: keyboardLayoutDir)
+/// ```
 public class LowMemorySymSpell {
     /// Maximum edit distance for lookups
     public let maxEditDistance: Int
     /// Length of word prefixes for spell checking
     public let prefixLength: Int
+    /// Keyboard layout for spatial error weighting
+    public let keyboardLayout: KeyboardLayout
 
     // Data directory
     private let dataDir: URL
@@ -541,6 +554,9 @@ public class LowMemorySymSpell {
     private let deletes: MMapDeletes
     private let bigrams: MMapDictionary
 
+    // Keyboard layout for spatial weighting
+    private var keyboard: MMapKeyboardLayout?
+
     // Statistics
     public private(set) var wordCount: Int = 0
     public private(set) var bigramCount: Int = 0
@@ -550,10 +566,17 @@ public class LowMemorySymSpell {
     /// - Parameters:
     ///   - maxEditDistance: Maximum edit distance for lookups (default: 2)
     ///   - prefixLength: Length of word prefixes for spell checking (default: 7)
+    ///   - keyboardLayout: Keyboard layout for spatial error weighting (default: .none)
     ///   - dataDir: Directory for mmap files. If nil, uses a temporary directory.
-    public init(maxEditDistance: Int = 2, prefixLength: Int = 7, dataDir: URL? = nil) {
+    public init(
+        maxEditDistance: Int = 2,
+        prefixLength: Int = 7,
+        keyboardLayout: KeyboardLayout = .none,
+        dataDir: URL? = nil
+    ) {
         self.maxEditDistance = maxEditDistance
         self.prefixLength = prefixLength
+        self.keyboardLayout = keyboardLayout
 
         if let dataDir = dataDir {
             self.dataDir = dataDir
@@ -572,6 +595,11 @@ public class LowMemorySymSpell {
         self.words = MMapDictionary(filePath: wordsPath)
         self.deletes = MMapDeletes(filePath: deletesPath)
         self.bigrams = MMapDictionary(filePath: bigramsPath)
+
+        // Initialize keyboard layout if specified
+        if keyboardLayout != .none {
+            self.keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
     }
 
     deinit {
@@ -800,6 +828,45 @@ public class LowMemorySymSpell {
         } catch {
             return false
         }
+    }
+
+    /// Load keyboard layout from a directory containing layout files.
+    ///
+    /// The directory should contain files like `keyboard_qwerty.bin`, `keyboard_azerty.bin`, etc.
+    /// The appropriate file is selected based on the `keyboardLayout` set during initialization.
+    ///
+    /// - Parameter directory: Directory containing keyboard layout .bin files
+    /// - Returns: true if keyboard layout was loaded successfully
+    @discardableResult
+    public func loadKeyboardLayout(from directory: URL) -> Bool {
+        guard keyboardLayout != .none else { return true }
+
+        if keyboard == nil {
+            keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
+
+        return keyboard?.loadFromDirectory(directory) ?? false
+    }
+
+    /// Load keyboard layout from a specific file.
+    ///
+    /// - Parameter path: Path to the keyboard layout .bin file
+    /// - Returns: true if keyboard layout was loaded successfully
+    @discardableResult
+    public func loadKeyboardLayoutFile(from path: URL) -> Bool {
+        guard keyboardLayout != .none else { return true }
+
+        if keyboard == nil {
+            keyboard = MMapKeyboardLayout(layout: keyboardLayout)
+        }
+
+        return keyboard?.load(from: path) ?? false
+    }
+
+    /// Check if keyboard layout is loaded and active.
+    public var isKeyboardLayoutLoaded: Bool {
+        guard keyboardLayout != .none else { return false }
+        return keyboard != nil
     }
 
     // MARK: - Private Building Methods
@@ -1340,6 +1407,8 @@ public class LowMemorySymSpell {
         _prebuiltDeletes?.close()
         _prebuiltBigrams?.close()
 
+        keyboard?.close()
+
         // Cleanup temp directory if we created it
         if shouldCleanupDataDir {
             try? FileManager.default.removeItem(at: dataDir)
@@ -1350,11 +1419,14 @@ public class LowMemorySymSpell {
 
     /// Calculate Damerau-Levenshtein distance with early termination.
     ///
+    /// When a keyboard layout is loaded, uses weighted substitution costs where
+    /// adjacent key substitutions cost 0.5 instead of 1.0.
+    ///
     /// - Parameters:
     ///   - s1: First string
     ///   - s2: Second string
     ///   - maxDistance: Maximum distance to calculate
-    /// - Returns: Edit distance, or -1 if distance exceeds maxDistance
+    /// - Returns: Edit distance (floored to int), or -1 if distance exceeds maxDistance
     private func damerauLevenshteinDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Int {
         // Handle empty strings
         guard !s1.isEmpty else {
@@ -1372,9 +1444,34 @@ public class LowMemorySymSpell {
             return -1
         }
 
+        // Use keyboard-weighted distance if available
+        if let keyboard = keyboard, keyboard.keyboardLayout != .none {
+            let weightedDist = weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+            if weightedDist < 0 {
+                return -1
+            }
+            // Floor the weighted distance to int for compatibility with existing sorting
+            return Int(weightedDist)
+        }
+
         // Use the existing String extension for edit distance
         let distance = s1.distanceDamerauLevenshtein(between: s2)
         return distance <= maxDistance ? distance : -1
+    }
+
+    /// Calculate weighted edit distance as a Double for more precise comparisons.
+    ///
+    /// - Parameters:
+    ///   - s1: First string
+    ///   - s2: Second string
+    ///   - maxDistance: Maximum distance to calculate
+    /// - Returns: Weighted edit distance, or -1 if exceeds maxDistance
+    private func weightedEditDistance(_ s1: String, _ s2: String, _ maxDistance: Int) -> Double {
+        if let keyboard = keyboard, keyboard.keyboardLayout != .none {
+            return weightedDamerauLevenshteinDistance(s1, s2, maxDistance: maxDistance, keyboard: keyboard)
+        }
+        let dist = s1.distanceDamerauLevenshtein(between: s2)
+        return dist <= maxDistance ? Double(dist) : -1.0
     }
 
     /// Transfer casing from source to target word
