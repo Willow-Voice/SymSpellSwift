@@ -1027,4 +1027,150 @@ final class LowMemorySymSpellTests: XCTestCase {
 
         spellChecker.close()
     }
+
+    // MARK: - Configuration Tests
+
+    func testDefaultConfiguration() {
+        let config = SymSpellConfiguration.default
+
+        // Verify default values
+        XCTAssertEqual(config.minConfidence, 0.75)
+        XCTAssertEqual(config.distancePenaltyPerEdit, 0.2)
+        XCTAssertEqual(config.ambiguityPenaltyMultiplier, 0.6)
+        XCTAssertEqual(config.shortWordThreshold, 4)
+        XCTAssertEqual(config.beamSearchEditPenalty, 5.0)
+
+        // Verify ranking weights
+        XCTAssertEqual(config.balanced.distanceWeight, 0.5)
+        XCTAssertEqual(config.balanced.frequencyWeight, 0.3)
+        XCTAssertEqual(config.balanced.bigramBonusWeight, 0.2)
+
+        XCTAssertEqual(config.frequencyBoosted.distanceWeight, 0.3)
+        XCTAssertEqual(config.frequencyBoosted.frequencyWeight, 0.4)
+        XCTAssertEqual(config.frequencyBoosted.bigramBonusWeight, 0.3)
+    }
+
+    func testConservativeConfiguration() {
+        let config = SymSpellConfiguration.conservative
+
+        // Conservative should have higher confidence threshold
+        XCTAssertGreaterThan(config.minConfidence, SymSpellConfiguration.default.minConfidence)
+        // And higher edit penalty
+        XCTAssertGreaterThan(config.beamSearchEditPenalty, SymSpellConfiguration.default.beamSearchEditPenalty)
+    }
+
+    func testAggressiveConfiguration() {
+        let config = SymSpellConfiguration.aggressive
+
+        // Aggressive should have lower confidence threshold
+        XCTAssertLessThan(config.minConfidence, SymSpellConfiguration.default.minConfidence)
+        // And lower edit penalty
+        XCTAssertLessThan(config.beamSearchEditPenalty, SymSpellConfiguration.default.beamSearchEditPenalty)
+    }
+
+    func testCustomConfiguration() throws {
+        var config = SymSpellConfiguration()
+        config.minConfidence = 0.9
+        config.balanced.frequencyWeight = 0.5
+
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            configuration: config,
+            dataDir: tempDir
+        )
+
+        // Verify configuration is applied
+        XCTAssertEqual(spellChecker.configuration.minConfidence, 0.9)
+        XCTAssertEqual(spellChecker.configuration.balanced.frequencyWeight, 0.5)
+
+        spellChecker.close()
+    }
+
+    func testConfigurationCanBeModifiedAtRuntime() throws {
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            dataDir: tempDir
+        )
+
+        // Default configuration
+        XCTAssertEqual(spellChecker.configuration.minConfidence, 0.75)
+
+        // Modify at runtime
+        spellChecker.configuration.minConfidence = 0.85
+        XCTAssertEqual(spellChecker.configuration.minConfidence, 0.85)
+
+        // Modify ranking weights
+        spellChecker.configuration.balanced.frequencyWeight = 0.6
+        XCTAssertEqual(spellChecker.configuration.balanced.frequencyWeight, 0.6)
+
+        spellChecker.close()
+    }
+
+    func testConfigurationAffectsAutoCorrection() throws {
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            dataDir: tempDir
+        )
+
+        // Load test dictionary - note "helo" is NOT in dictionary
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        hello 5000000
+        help 500000
+        held 100000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // With default confidence (0.75), "helo" should correct to "hello"
+        // Use minConfidence: nil to get the tuple-returning version
+        let result1: (term: String, confidence: Double)? = spellChecker.autoCorrection(for: "helo", minConfidence: nil)
+        XCTAssertNotNil(result1, "Should find correction for 'helo'")
+        XCTAssertEqual(result1?.term, "hello")
+
+        // With very high confidence threshold (0.99), should return nil
+        spellChecker.configuration.minConfidence = 0.99
+        let result2: (term: String, confidence: Double)? = spellChecker.autoCorrection(for: "helo", minConfidence: nil)
+        XCTAssertNil(result2, "With 0.99 confidence threshold, should not auto-correct")
+
+        spellChecker.close()
+    }
+
+    func testConfigurationWithCustomRankingWeights() throws {
+        var config = SymSpellConfiguration()
+        // Heavily favor frequency over distance
+        config.balanced.distanceWeight = 0.1
+        config.balanced.frequencyWeight = 0.8
+        config.balanced.bigramBonusWeight = 0.1
+
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .balanced,
+            configuration: config,
+            dataDir: tempDir
+        )
+
+        // Load test dictionary
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        hello 10000000
+        hallo 1000
+        held 5000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // With heavy frequency weighting, "helo" should prefer "hello" (very common)
+        // even though "held" might be closer
+        let suggestions = spellChecker.lookup(phrase: "helo", verbosity: .all)
+        XCTAssertFalse(suggestions.isEmpty)
+        // "hello" should rank high due to frequency boosting
+        XCTAssertTrue(suggestions.contains { $0.term == "hello" })
+
+        spellChecker.close()
+    }
 }

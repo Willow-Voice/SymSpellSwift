@@ -8,6 +8,163 @@
 
 import Foundation
 
+// MARK: - SymSpellConfiguration
+
+/// Configuration for tunable parameters in SymSpellSwift.
+///
+/// Use this to customize ranking weights, confidence thresholds, and other parameters
+/// without needing to update the package. All values have sensible defaults.
+///
+/// Example:
+/// ```swift
+/// var config = SymSpellConfiguration()
+/// config.minConfidence = 0.8  // More conservative auto-correction
+/// config.balanced.frequencyWeight = 0.4  // Boost frequency importance
+///
+/// let symSpell = LowMemorySymSpell(configuration: config)
+/// ```
+public struct SymSpellConfiguration: Sendable {
+
+    // MARK: - Ranking Mode Weights
+
+    /// Weights for balanced ranking mode
+    public struct BalancedWeights: Sendable {
+        /// Weight for distance score (0.0-1.0). Higher = distance matters more.
+        public var distanceWeight: Double = 0.5
+        /// Weight for frequency score (0.0-1.0). Higher = common words rank higher.
+        public var frequencyWeight: Double = 0.3
+        /// Weight for bigram context bonus (0.0-1.0). Higher = previous word context matters more.
+        public var bigramBonusWeight: Double = 0.2
+
+        public init() {}
+
+        public init(distanceWeight: Double, frequencyWeight: Double, bigramBonusWeight: Double) {
+            self.distanceWeight = distanceWeight
+            self.frequencyWeight = frequencyWeight
+            self.bigramBonusWeight = bigramBonusWeight
+        }
+    }
+
+    /// Weights for frequency-boosted ranking mode
+    public struct FrequencyBoostedWeights: Sendable {
+        /// Weight for distance score (0.0-1.0). Lower than balanced = more tolerance for edits.
+        public var distanceWeight: Double = 0.3
+        /// Weight for frequency score (0.0-1.0). Higher = strongly favor common words.
+        public var frequencyWeight: Double = 0.4
+        /// Weight for bigram context bonus (0.0-1.0). Higher = previous word context matters more.
+        public var bigramBonusWeight: Double = 0.3
+
+        public init() {}
+
+        public init(distanceWeight: Double, frequencyWeight: Double, bigramBonusWeight: Double) {
+            self.distanceWeight = distanceWeight
+            self.frequencyWeight = frequencyWeight
+            self.bigramBonusWeight = bigramBonusWeight
+        }
+    }
+
+    /// Weights for distance-first ranking mode
+    public struct DistanceFirstWeights: Sendable {
+        /// Multiplier for bigram frequency bonus in distance-first mode.
+        /// Higher values give more weight to words that commonly follow the previous word.
+        public var bigramBonusMultiplier: Double = 10.0
+
+        public init() {}
+
+        public init(bigramBonusMultiplier: Double) {
+            self.bigramBonusMultiplier = bigramBonusMultiplier
+        }
+    }
+
+    /// Weights for balanced ranking mode
+    public var balanced = BalancedWeights()
+
+    /// Weights for frequency-boosted ranking mode
+    public var frequencyBoosted = FrequencyBoostedWeights()
+
+    /// Weights for distance-first ranking mode
+    public var distanceFirst = DistanceFirstWeights()
+
+    // MARK: - Auto-Correction Confidence
+
+    /// Minimum confidence threshold for auto-correction (0.0-1.0).
+    /// Corrections below this threshold won't be applied automatically.
+    public var minConfidence: Double = 0.75
+
+    /// Penalty per edit distance unit (0.0-1.0).
+    /// Distance 1 = this penalty, Distance 2 = 2x this penalty.
+    public var distancePenaltyPerEdit: Double = 0.2
+
+    /// Multiplier for ambiguity penalty when multiple suggestions have similar frequency.
+    /// Higher = more penalty when there's no clear winner.
+    public var ambiguityPenaltyMultiplier: Double = 0.6
+
+    /// Penalty per character below the short word threshold.
+    /// Short words are riskier to auto-correct.
+    public var shortWordPenaltyPerChar: Double = 0.07
+
+    /// Words shorter than this are considered "short" and get extra penalty.
+    public var shortWordThreshold: Int = 4
+
+    /// Bonus confidence for very high frequency words.
+    public var highFrequencyBonus: Double = 0.05
+
+    /// Frequency threshold above which highFrequencyBonus is applied.
+    public var highFrequencyThreshold: Int = 100000
+
+    /// Maximum confidence for correcting a valid (in-dictionary) word.
+    /// Valid words are usually intentional, so corrections should be conservative.
+    public var validWordMaxConfidence: Double = 0.6
+
+    /// Minimum frequency ratio required to suggest correcting a valid word.
+    /// Suggestion must be this many times more frequent than the original.
+    public var validWordMinFrequencyRatio: Double = 10.0
+
+    // MARK: - Word Segmentation (Beam Search)
+
+    /// Edit distance penalty per edit in beam search segmentation.
+    /// Higher = more conservative corrections during segmentation.
+    public var beamSearchEditPenalty: Double = 5.0
+
+    // MARK: - Initialization
+
+    public init() {}
+
+    /// Create configuration with custom confidence threshold
+    public init(minConfidence: Double) {
+        self.minConfidence = minConfidence
+    }
+
+    // MARK: - Presets
+
+    /// Default configuration with balanced settings
+    public static let `default` = SymSpellConfiguration()
+
+    /// Conservative configuration that minimizes false corrections
+    public static var conservative: SymSpellConfiguration {
+        var config = SymSpellConfiguration()
+        config.minConfidence = 0.85
+        config.distancePenaltyPerEdit = 0.25
+        config.ambiguityPenaltyMultiplier = 0.8
+        config.validWordMaxConfidence = 0.5
+        config.validWordMinFrequencyRatio = 20.0
+        config.beamSearchEditPenalty = 7.0
+        return config
+    }
+
+    /// Aggressive configuration that corrects more liberally
+    public static var aggressive: SymSpellConfiguration {
+        var config = SymSpellConfiguration()
+        config.minConfidence = 0.6
+        config.distancePenaltyPerEdit = 0.15
+        config.ambiguityPenaltyMultiplier = 0.4
+        config.validWordMaxConfidence = 0.7
+        config.validWordMinFrequencyRatio = 5.0
+        config.beamSearchEditPenalty = 3.0
+        return config
+    }
+}
+
 // MARK: - Composition
 
 /// Result of word segmentation operation
@@ -38,7 +195,7 @@ public struct Composition {
 /// - Original segments before correction (for comparison)
 /// - Position in the input string
 /// - Cumulative edit distance and bigram probability scores
-struct SegmentationHypothesis: Comparable {
+struct SegmentationHypothesis {
     /// Corrected words found so far
     let words: [String]
     /// Original segments before correction
@@ -49,21 +206,15 @@ struct SegmentationHypothesis: Comparable {
     let totalEditDistance: Int
     /// Sum of log(bigram_frequency) for scoring
     let bigramLogProbSum: Double
-    /// Combined score (higher is better)
-    var score: Double {
+
+    /// Calculate combined score (higher is better)
+    ///
+    /// - Parameter editPenalty: Penalty per edit distance unit (from configuration)
+    /// - Returns: Score balancing bigram probability and edit distance
+    func score(editPenalty: Double) -> Double {
         // Balance: prefer common phrases (positive), penalize corrections (negative)
-        // Edit distance penalty: each edit reduces score significantly
-        // Higher penalty (5.0) ensures corrections are only used when necessary
-        let editPenalty = Double(totalEditDistance) * 5.0
-        return bigramLogProbSum - editPenalty
-    }
-
-    static func < (lhs: SegmentationHypothesis, rhs: SegmentationHypothesis) -> Bool {
-        return lhs.score < rhs.score
-    }
-
-    static func == (lhs: SegmentationHypothesis, rhs: SegmentationHypothesis) -> Bool {
-        return lhs.score == rhs.score
+        let penalty = Double(totalEditDistance) * editPenalty
+        return bigramLogProbSum - penalty
     }
 
     /// Create an initial empty hypothesis
@@ -153,17 +304,21 @@ public enum RankingMode {
 ///
 /// Additionally supports bigram context: if a previous word is provided, suggestions that
 /// commonly follow that word get a score boost.
+///
+/// All weights are configurable via `SymSpellConfiguration`.
 struct SuggestionScorer {
     let maxEditDistance: Int
     let maxFrequency: Int
     let maxBigramFrequency: Int
     let mode: RankingMode
+    let config: SymSpellConfiguration
 
-    init(maxEditDistance: Int, maxFrequency: Int, maxBigramFrequency: Int = 0, mode: RankingMode) {
+    init(maxEditDistance: Int, maxFrequency: Int, maxBigramFrequency: Int = 0, mode: RankingMode, config: SymSpellConfiguration = .default) {
         self.maxEditDistance = maxEditDistance
         self.maxFrequency = maxFrequency
         self.maxBigramFrequency = maxBigramFrequency
         self.mode = mode
+        self.config = config
     }
 
     /// Calculate a combined score for a suggestion (higher is better).
@@ -183,7 +338,7 @@ struct SuggestionScorer {
 
             // Bigram bonus: if this word commonly follows the previous word, boost it
             if bigramFrequency > 0 {
-                freqScore += Double(bigramFrequency) * 10.0
+                freqScore += Double(bigramFrequency) * config.distanceFirst.bigramBonusMultiplier
             }
 
             return distanceScore + freqScore
@@ -196,17 +351,17 @@ struct SuggestionScorer {
 
             let distancePenalty = Double(distance) / Double(max(1, maxEditDistance))
 
-            // Bigram bonus (0 to 0.2 additional score)
+            // Bigram bonus
             var bigramBonus = 0.0
             if bigramFrequency > 0 && maxBigramFrequency > 0 {
                 let normalizedBigram = log10(Double(bigramFrequency) + 1) / log10(Double(maxBigramFrequency) + 1)
-                bigramBonus = normalizedBigram * 0.2
+                bigramBonus = normalizedBigram * config.balanced.bigramBonusWeight
             }
 
-            // Combined score: 50% distance, 30% frequency, 20% bigram
-            let distanceWeight = 0.5
-            let frequencyWeight = 0.3
-            return (1.0 - distancePenalty) * distanceWeight + normalizedFreq * frequencyWeight + bigramBonus
+            // Combined score using configurable weights
+            return (1.0 - distancePenalty) * config.balanced.distanceWeight +
+                   normalizedFreq * config.balanced.frequencyWeight +
+                   bigramBonus
 
         case .frequencyBoosted:
             // Aggressive frequency boosting with bigram context
@@ -216,17 +371,17 @@ struct SuggestionScorer {
 
             let distancePenalty = Double(distance) / Double(max(1, maxEditDistance))
 
-            // Stronger bigram bonus (0 to 0.3)
+            // Stronger bigram bonus
             var bigramBonus = 0.0
             if bigramFrequency > 0 && maxBigramFrequency > 0 {
                 let normalizedBigram = log10(Double(bigramFrequency) + 1) / log10(Double(maxBigramFrequency) + 1)
-                bigramBonus = normalizedBigram * 0.3
+                bigramBonus = normalizedBigram * config.frequencyBoosted.bigramBonusWeight
             }
 
-            // Combined: 30% distance, 40% frequency, 30% bigram
-            let distanceWeight = 0.3
-            let frequencyWeight = 0.4
-            return (1.0 - distancePenalty) * distanceWeight + normalizedFreq * frequencyWeight + bigramBonus
+            // Combined score using configurable weights
+            return (1.0 - distancePenalty) * config.frequencyBoosted.distanceWeight +
+                   normalizedFreq * config.frequencyBoosted.frequencyWeight +
+                   bigramBonus
         }
     }
 }
@@ -759,6 +914,8 @@ public class LowMemorySymSpell {
     public let keyboardLayout: KeyboardLayout
     /// Ranking mode for sorting suggestions
     public let rankingMode: RankingMode
+    /// Configuration for tunable parameters (thresholds, weights, etc.)
+    public var configuration: SymSpellConfiguration
 
     // Data directory
     private let dataDir: URL
@@ -792,18 +949,21 @@ public class LowMemorySymSpell {
     ///   - prefixLength: Length of word prefixes for spell checking (default: 7)
     ///   - keyboardLayout: Keyboard layout for spatial error weighting (default: .none)
     ///   - rankingMode: How to rank suggestions - `.distanceFirst` (default), `.balanced`, or `.frequencyBoosted`
+    ///   - configuration: Configuration for tunable parameters (default: .default)
     ///   - dataDir: Directory for mmap files. If nil, uses a temporary directory.
     public init(
         maxEditDistance: Int = 2,
         prefixLength: Int = 7,
         keyboardLayout: KeyboardLayout = .none,
         rankingMode: RankingMode = .distanceFirst,
+        configuration: SymSpellConfiguration = .default,
         dataDir: URL? = nil
     ) {
         self.maxEditDistance = maxEditDistance
         self.prefixLength = prefixLength
         self.keyboardLayout = keyboardLayout
         self.rankingMode = rankingMode
+        self.configuration = configuration
 
         if let dataDir = dataDir {
             self.dataDir = dataDir
@@ -1342,7 +1502,8 @@ public class LowMemorySymSpell {
                     maxEditDistance: maxDist,
                     maxFrequency: maxFrequency,
                     maxBigramFrequency: maxBigramFrequency,
-                    mode: rankingMode
+                    mode: rankingMode,
+                    config: configuration
                 )
 
                 // Calculate scores with bigram context
@@ -1405,12 +1566,14 @@ public class LowMemorySymSpell {
     /// Confidence factors in:
     /// - **Edit distance**: Lower distance = higher confidence
     /// - **Frequency ratio**: Clear winner among suggestions = higher confidence
-    /// - **Word length**: Short words (< 4 chars) are penalized as they're riskier
+    /// - **Word length**: Short words (< threshold chars) are penalized as they're riskier
     /// - **Ambiguity**: Similar frequencies among top suggestions = lower confidence
+    ///
+    /// All thresholds and penalties are configurable via `SymSpellConfiguration`.
     ///
     /// - Parameters:
     ///   - word: The word to check for correction
-    ///   - minConfidence: Minimum confidence threshold (default: 0.75)
+    ///   - minConfidence: Minimum confidence threshold. If nil, uses `configuration.minConfidence`.
     /// - Returns: Tuple of (corrected term, confidence score), or nil if no confident correction
     ///
     /// Returns nil if:
@@ -1424,7 +1587,8 @@ public class LowMemorySymSpell {
     ///     // Replace "teh" with correction (likely "the")
     /// }
     /// ```
-    public func autoCorrection(for word: String, minConfidence: Double = 0.75) -> (term: String, confidence: Double)? {
+    public func autoCorrection(for word: String, minConfidence: Double? = nil) -> (term: String, confidence: Double)? {
+        let threshold = minConfidence ?? configuration.minConfidence
         let lowercaseWord = word.lowercased()
         let wordFrequency = activeWords.get(lowercaseWord)
         let isValid = wordFrequency > 0
@@ -1445,13 +1609,15 @@ public class LowMemorySymSpell {
 
             // Only consider correction if:
             // 1. Alternative is distance 1 (close typo)
-            // 2. Alternative is significantly more popular (10x or more)
+            // 2. Alternative is significantly more popular (configurable ratio)
             let frequencyRatio = Double(bestAlt.count) / Double(max(1, wordFrequency))
-            if bestAlt.distance == 1 && frequencyRatio >= 10.0 {
+            if bestAlt.distance == 1 && frequencyRatio >= configuration.validWordMinFrequencyRatio {
                 // Apply heavy penalty - valid words are usually intentional
-                // Max confidence of 0.6 for valid word corrections
-                let confidence = min(0.6, 0.3 + (frequencyRatio / 100.0) * 0.3)
-                if confidence >= minConfidence {
+                let confidence = min(
+                    configuration.validWordMaxConfidence,
+                    0.3 + (frequencyRatio / 100.0) * 0.3
+                )
+                if confidence >= threshold {
                     return (bestAlt.term, confidence)
                 }
             }
@@ -1467,42 +1633,40 @@ public class LowMemorySymSpell {
         // Calculate confidence score
         var confidence = 1.0
 
-        // Factor 1: Edit distance penalty (0.0 to 0.4 penalty)
-        // Distance 1 = 0.15 penalty, Distance 2 = 0.4 penalty
-        let distancePenalty = Double(top.distance) * 0.2
+        // Factor 1: Edit distance penalty
+        let distancePenalty = Double(top.distance) * configuration.distancePenaltyPerEdit
         confidence -= distancePenalty
 
-        // Factor 2: Frequency ratio / ambiguity (0.0 to 0.3 penalty)
+        // Factor 2: Frequency ratio / ambiguity
         // If second-best suggestion has similar frequency, reduce confidence
         let sameDistanceSuggestions = suggestions.filter { $0.distance == top.distance }
         if sameDistanceSuggestions.count > 1, let second = sameDistanceSuggestions.dropFirst().first {
             let totalCount = Double(top.count + second.count)
             if totalCount > 0 {
                 let ratio = Double(top.count) / totalCount
-                // ratio of 0.5 (equal) = 0.3 penalty, ratio of 1.0 (clear winner) = 0 penalty
-                let ambiguityPenalty = (1.0 - ratio) * 0.6
+                // ratio of 0.5 (equal) = full penalty, ratio of 1.0 (clear winner) = 0 penalty
+                let ambiguityPenalty = (1.0 - ratio) * configuration.ambiguityPenaltyMultiplier
                 confidence -= ambiguityPenalty
             }
         }
 
-        // Factor 3: Short word penalty (0.0 to 0.2 penalty)
-        // Words < 4 chars are riskier to auto-correct
-        if lowercaseWord.count < 4 {
-            let shortWordPenalty = Double(4 - lowercaseWord.count) * 0.07
+        // Factor 3: Short word penalty
+        // Words below threshold chars are riskier to auto-correct
+        if lowercaseWord.count < configuration.shortWordThreshold {
+            let shortWordPenalty = Double(configuration.shortWordThreshold - lowercaseWord.count) * configuration.shortWordPenaltyPerChar
             confidence -= shortWordPenalty
         }
 
         // Factor 4: Bonus for very high frequency words
-        // If top suggestion is very common, boost confidence slightly
-        if top.count > 100000 {
-            confidence += 0.05
+        if top.count > configuration.highFrequencyThreshold {
+            confidence += configuration.highFrequencyBonus
         }
 
         // Clamp confidence to [0, 1]
         confidence = max(0.0, min(1.0, confidence))
 
         // Return nil if below threshold
-        guard confidence >= minConfidence else {
+        guard confidence >= threshold else {
             return nil
         }
 
@@ -1823,7 +1987,8 @@ public class LowMemorySymSpell {
             }
 
             // Prune beam to top beamWidth hypotheses
-            nextBeam.sort { $0.score > $1.score }
+            let editPenalty = configuration.beamSearchEditPenalty
+            nextBeam.sort { $0.score(editPenalty: editPenalty) > $1.score(editPenalty: editPenalty) }
             beam = Array(nextBeam.prefix(beamWidth))
 
             // Early exit if beam is empty
@@ -1834,9 +1999,10 @@ public class LowMemorySymSpell {
 
         // Find best completed hypothesis
         let completedHypotheses = beam.filter { $0.position >= inputLen }
+        let editPenaltyForComparison = configuration.beamSearchEditPenalty
 
         // If we found valid segmentations, use the best one
-        if let best = completedHypotheses.max(by: { $0.score < $1.score }) {
+        if let best = completedHypotheses.max(by: { $0.score(editPenalty: editPenaltyForComparison) < $1.score(editPenalty: editPenaltyForComparison) }) {
             // Compare against keeping input as single word
             let singleWordFreq = activeWords.get(input)
 
