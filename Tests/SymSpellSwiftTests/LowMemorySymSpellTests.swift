@@ -1028,6 +1028,57 @@ final class LowMemorySymSpellTests: XCTestCase {
         spellChecker.close()
     }
 
+    func testBigramContextOverridesValidWord() throws {
+        // Test that bigram context can suggest a different word even when input is valid.
+        // "bow" is a valid word, but "wonder how" is a common bigram so "how" should rank higher.
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .frequencyBoosted,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        bow 50000
+        how 500000
+        wonder 100000
+        cow 40000
+        row 30000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        wonder how 1000000
+        wonder bow 100
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
+
+        // Without context: "bow" should be returned as-is (exact match)
+        let suggestionsNoContext = spellChecker.lookup(phrase: "bow", verbosity: .closest)
+        XCTAssertFalse(suggestionsNoContext.isEmpty)
+        XCTAssertEqual(suggestionsNoContext[0].term, "bow", "Without context, exact match 'bow' should be returned")
+        XCTAssertEqual(suggestionsNoContext[0].distance, 0)
+
+        // With context "wonder": bigram "wonder how" is much more common than "wonder bow"
+        // So "how" should rank higher, even though "bow" is the exact input
+        let suggestionsWithContext = spellChecker.lookup(
+            phrase: "bow",
+            verbosity: .closest,
+            previousWord: "wonder"
+        )
+        XCTAssertFalse(suggestionsWithContext.isEmpty)
+        // With frequencyBoosted mode and strong bigram boost, "how" should be first
+        XCTAssertEqual(suggestionsWithContext[0].term, "how",
+                       "After 'wonder', 'how' should rank higher than 'bow' due to bigram 'wonder how'")
+
+        spellChecker.close()
+    }
+
     // MARK: - Configuration Tests
 
     func testDefaultConfiguration() {

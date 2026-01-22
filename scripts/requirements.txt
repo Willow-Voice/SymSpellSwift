@@ -1,0 +1,4 @@
+# Python dependencies for SymSpellSwift build scripts
+# Install with: pip install -r scripts/requirements.txt
+
+symspellpy>=6.7.0

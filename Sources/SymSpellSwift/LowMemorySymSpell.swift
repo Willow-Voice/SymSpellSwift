@@ -1372,10 +1372,15 @@ public class LowMemorySymSpell {
 
         // Check for exact match
         let count = activeWords.get(phrase)
+        var hasExactMatch = false
         if count > 0 {
             let term = transferCasing ? originalPhrase : phrase
             suggestions.append(SuggestItem(term: term, distance: 0, count: count))
-            if verbosity != .all {
+            hasExactMatch = true
+            // When previousWord is provided, continue searching for alternatives
+            // so bigram context can potentially rank a different word higher.
+            // e.g., "wonder bow" should find "how" because "wonder how" is a common bigram.
+            if verbosity != .all && previousWord == nil {
                 return suggestions
             }
         }
@@ -1389,7 +1394,9 @@ public class LowMemorySymSpell {
 
         // Generate candidates
         var consideredSuggestions = Set<String>([phrase])
-        var maxEditDistance2 = maxDist
+        // When we have an exact match and bigram context, limit search to distance 1
+        // alternatives. We don't need distance 2+ since we already have the exact word.
+        var maxEditDistance2 = (hasExactMatch && previousWord != nil) ? min(1, maxDist) : maxDist
         var candidates: [String] = []
 
         let phrasePrefixLen = min(phraseLen, prefixLength)
@@ -1448,20 +1455,36 @@ public class LowMemorySymSpell {
                     }
 
                     if !suggestions.isEmpty {
+                        // When we have an exact match and bigram context, use .all behavior
+                        // to keep the exact match AND add alternatives for ranking comparison.
+                        // e.g., "wonder bow" keeps "bow" (exact) and adds "how" (distance 1),
+                        // then ranking uses bigram "wonder how" to decide final order.
+                        let useAllBehavior = hasExactMatch && previousWord != nil
+
                         switch verbosity {
                         case .closest:
-                            if distance < maxEditDistance2 {
-                                suggestions.removeAll()
+                            if useAllBehavior {
+                                // Keep exact match, add this suggestion for ranking
+                                suggestions.append(item)
+                            } else {
+                                if distance < maxEditDistance2 {
+                                    suggestions.removeAll()
+                                }
+                                maxEditDistance2 = distance
+                                suggestions.append(item)
                             }
-                            maxEditDistance2 = distance
-                            suggestions.append(item)
 
                         case .top:
-                            if distance < maxEditDistance2 || suggestionCount > suggestions[0].count {
-                                maxEditDistance2 = distance
-                                suggestions[0] = item
+                            if useAllBehavior {
+                                // Keep exact match, add this suggestion for ranking
+                                suggestions.append(item)
+                            } else {
+                                if distance < maxEditDistance2 || suggestionCount > suggestions[0].count {
+                                    maxEditDistance2 = distance
+                                    suggestions[0] = item
+                                }
+                                continue
                             }
-                            continue
 
                         case .all:
                             suggestions.append(item)
