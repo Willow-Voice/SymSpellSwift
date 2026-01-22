@@ -126,6 +126,90 @@ public struct SymSpellConfiguration: Sendable {
     /// Higher = more conservative corrections during segmentation.
     public var beamSearchEditPenalty: Double = 5.0
 
+    // MARK: - Autocapitalization
+
+    /// Settings for automatic capitalization rules.
+    public struct AutocapitalizationSettings: Sendable {
+        /// Enable autocapitalization (master switch)
+        public var enabled: Bool = true
+
+        /// Capitalize standalone "i" to "I"
+        public var capitalizeI: Bool = true
+
+        /// Capitalize "i" in contractions: "i'm" → "I'm", "i've" → "I've", etc.
+        public var capitalizeIContractions: Bool = true
+
+        /// Capitalize first letter after sentence-ending punctuation (. ! ?)
+        public var capitalizeSentenceStart: Bool = true
+
+        /// Custom words that should always be capitalized (e.g., ["api"] → "API")
+        public var alwaysCapitalize: [String: String] = [:]
+
+        public init() {}
+
+        public init(
+            enabled: Bool = true,
+            capitalizeI: Bool = true,
+            capitalizeIContractions: Bool = true,
+            capitalizeSentenceStart: Bool = true,
+            alwaysCapitalize: [String: String] = [:]
+        ) {
+            self.enabled = enabled
+            self.capitalizeI = capitalizeI
+            self.capitalizeIContractions = capitalizeIContractions
+            self.capitalizeSentenceStart = capitalizeSentenceStart
+            self.alwaysCapitalize = alwaysCapitalize
+        }
+    }
+
+    /// Autocapitalization settings
+    public var autocapitalization = AutocapitalizationSettings()
+
+    // MARK: - Suffix Handling
+
+    /// Settings for recognizing valid words with common suffixes.
+    /// Helps avoid incorrect corrections for words like "cats" (cat + s) that may not be in the dictionary.
+    public struct SuffixSettings: Sendable {
+        /// Enable suffix recognition (master switch)
+        public var enabled: Bool = true
+
+        /// Common plural suffixes: -s, -es
+        public var handlePlurals: Bool = true
+
+        /// Verb suffixes: -ed, -ing, -s, -es
+        public var handleVerbForms: Bool = true
+
+        /// Possessive: -'s
+        public var handlePossessives: Bool = true
+
+        /// Adverb suffix: -ly
+        public var handleAdverbs: Bool = true
+
+        /// Comparative/superlative: -er, -est
+        public var handleComparatives: Bool = true
+
+        public init() {}
+
+        public init(
+            enabled: Bool = true,
+            handlePlurals: Bool = true,
+            handleVerbForms: Bool = true,
+            handlePossessives: Bool = true,
+            handleAdverbs: Bool = true,
+            handleComparatives: Bool = true
+        ) {
+            self.enabled = enabled
+            self.handlePlurals = handlePlurals
+            self.handleVerbForms = handleVerbForms
+            self.handlePossessives = handlePossessives
+            self.handleAdverbs = handleAdverbs
+            self.handleComparatives = handleComparatives
+        }
+    }
+
+    /// Suffix handling settings
+    public var suffixHandling = SuffixSettings()
+
     // MARK: - Initialization
 
     public init() {}
@@ -329,6 +413,12 @@ struct SuggestionScorer {
     ///   - bigramFrequency: Bigram frequency with previous word (0 if no context)
     /// - Returns: Combined score (higher = better ranking)
     func score(distance: Int, frequency: Int, bigramFrequency: Int = 0) -> Double {
+        // Exact match bonus: very small to act as a tiebreaker only.
+        // When comparing candidates in bigram context, we want bigram scoring to decide.
+        // The lookup logic already returns early for exact matches when there's no previousWord,
+        // so we don't need a large bonus here - just a small tiebreaker for equal scores.
+        let exactMatchBonus: Double = distance == 0 ? 0.01 : 0.0
+
         switch mode {
         case .distanceFirst:
             // Traditional: distance primary, frequency secondary (as tiebreaker)
@@ -359,7 +449,8 @@ struct SuggestionScorer {
             }
 
             // Combined score using configurable weights
-            return (1.0 - distancePenalty) * config.balanced.distanceWeight +
+            return exactMatchBonus +
+                   (1.0 - distancePenalty) * config.balanced.distanceWeight +
                    normalizedFreq * config.balanced.frequencyWeight +
                    bigramBonus
 
@@ -379,7 +470,8 @@ struct SuggestionScorer {
             }
 
             // Combined score using configurable weights
-            return (1.0 - distancePenalty) * config.frequencyBoosted.distanceWeight +
+            return exactMatchBonus +
+                   (1.0 - distancePenalty) * config.frequencyBoosted.distanceWeight +
                    normalizedFreq * config.frequencyBoosted.frequencyWeight +
                    bigramBonus
         }
@@ -1563,6 +1655,8 @@ public class LowMemorySymSpell {
     /// - Parameters:
     ///   - prefix: The prefix to search for
     ///   - limit: Maximum number of results to return (default: 5)
+    ///   - minFrequency: Minimum word frequency to include. If nil, uses adaptive threshold
+    ///                   based on prefix length (shorter prefix = higher threshold to avoid rare words).
     /// - Returns: Array of SuggestItem with distance 0, sorted by frequency (highest first)
     ///
     /// Example:
@@ -1570,14 +1664,45 @@ public class LowMemorySymSpell {
     /// let completions = symSpell.prefixLookup(prefix: "hel", limit: 3)
     /// // Returns: ["hello", "help", "helmet", ...] sorted by frequency
     /// ```
-    public func prefixLookup(prefix: String, limit: Int = 5) -> [SuggestItem] {
+    ///
+    /// **Frequency Filtering:**
+    /// For short prefixes (1-3 chars), rare words are filtered out to avoid suggesting
+    /// obscure words like "Thackeray" for prefix "Tha". The threshold scales with prefix length:
+    /// - 1-2 chars: min frequency 10000 (only very common words)
+    /// - 3 chars: min frequency 1000
+    /// - 4+ chars: min frequency 100
+    public func prefixLookup(prefix: String, limit: Int = 5, minFrequency: Int? = nil) -> [SuggestItem] {
         let lowercasePrefix = prefix.lowercased()
 
         guard !lowercasePrefix.isEmpty else { return [] }
 
-        let matches = activeWords.findWordsWithPrefix(lowercasePrefix, limit: limit)
+        // Calculate adaptive minimum frequency based on prefix length
+        // Short prefixes require higher frequency to avoid rare word suggestions
+        let adaptiveMinFreq: Int
+        if let minFreq = minFrequency {
+            adaptiveMinFreq = minFreq
+        } else {
+            switch lowercasePrefix.count {
+            case 1...2:
+                adaptiveMinFreq = 10000  // Only very common words for 1-2 char prefixes
+            case 3:
+                adaptiveMinFreq = 1000   // Common words for 3 char prefixes
+            case 4:
+                adaptiveMinFreq = 100    // Most words for 4 char prefixes
+            default:
+                adaptiveMinFreq = 10     // Nearly all words for 5+ char prefixes
+            }
+        }
 
-        return matches.map { word, count in
+        // Get more matches than needed, then filter by frequency
+        let matches = activeWords.findWordsWithPrefix(lowercasePrefix, limit: limit * 3)
+
+        // Filter by minimum frequency and take top results
+        let filtered = matches
+            .filter { $0.count >= adaptiveMinFreq }
+            .prefix(limit)
+
+        return filtered.map { word, count in
             SuggestItem(term: word, distance: 0, count: count)
         }
     }
@@ -2422,5 +2547,335 @@ extension LowMemorySymSpell: KeyboardSpellChecker {
         }
 
         return nil
+    }
+}
+
+// MARK: - Autocapitalization Utilities
+
+/// Utility for applying autocapitalization rules.
+///
+/// Example usage:
+/// ```swift
+/// let settings = SymSpellConfiguration.AutocapitalizationSettings()
+/// let capitalizer = Autocapitalizer(settings: settings)
+///
+/// capitalizer.capitalize("i")           // → "I"
+/// capitalizer.capitalize("i'm")         // → "I'm"
+/// capitalizer.capitalize("hello", afterSentenceEnd: true)  // → "Hello"
+/// ```
+public struct Autocapitalizer: Sendable {
+    public let settings: SymSpellConfiguration.AutocapitalizationSettings
+
+    /// I-contractions that should be capitalized
+    private static let iContractions: Set<String> = [
+        "i'm", "i've", "i'll", "i'd"
+    ]
+
+    public init(settings: SymSpellConfiguration.AutocapitalizationSettings = .init()) {
+        self.settings = settings
+    }
+
+    /// Apply autocapitalization rules to a word.
+    ///
+    /// - Parameters:
+    ///   - word: The word to potentially capitalize
+    ///   - afterSentenceEnd: Whether this word follows sentence-ending punctuation
+    /// - Returns: The word with appropriate capitalization applied
+    public func capitalize(_ word: String, afterSentenceEnd: Bool = false) -> String {
+        guard settings.enabled else { return word }
+
+        let lowercased = word.lowercased()
+
+        // Check custom always-capitalize words first
+        if let customCapitalization = settings.alwaysCapitalize[lowercased] {
+            return customCapitalization
+        }
+
+        // Capitalize standalone "i"
+        if settings.capitalizeI && lowercased == "i" {
+            return "I"
+        }
+
+        // Capitalize I-contractions: "i'm" → "I'm", etc.
+        if settings.capitalizeIContractions && Self.iContractions.contains(lowercased) {
+            return "I" + word.dropFirst()
+        }
+
+        // Capitalize sentence start
+        if settings.capitalizeSentenceStart && afterSentenceEnd && !word.isEmpty {
+            return word.prefix(1).uppercased() + word.dropFirst()
+        }
+
+        return word
+    }
+
+    /// Check if a word needs autocapitalization.
+    ///
+    /// - Parameters:
+    ///   - word: The word to check
+    ///   - afterSentenceEnd: Whether this word follows sentence-ending punctuation
+    /// - Returns: true if the word would be modified by capitalize()
+    public func needsCapitalization(_ word: String, afterSentenceEnd: Bool = false) -> Bool {
+        guard settings.enabled else { return false }
+
+        let lowercased = word.lowercased()
+
+        // Check custom words
+        if settings.alwaysCapitalize[lowercased] != nil {
+            return word != settings.alwaysCapitalize[lowercased]
+        }
+
+        // Check standalone "i"
+        if settings.capitalizeI && lowercased == "i" && word != "I" {
+            return true
+        }
+
+        // Check I-contractions
+        if settings.capitalizeIContractions && Self.iContractions.contains(lowercased) {
+            return !word.hasPrefix("I")
+        }
+
+        // Check sentence start
+        if settings.capitalizeSentenceStart && afterSentenceEnd && !word.isEmpty {
+            return word.first?.isLowercase == true
+        }
+
+        return false
+    }
+
+    /// Detect if the previous text ends with sentence-ending punctuation.
+    ///
+    /// - Parameter text: The text before the current word
+    /// - Returns: true if text ends with . ! ? followed by optional whitespace
+    public static func endsWithSentenceEnd(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        guard let lastChar = trimmed.last else { return true } // Empty = start of text
+        return lastChar == "." || lastChar == "!" || lastChar == "?"
+    }
+}
+
+// MARK: - Suffix Handler
+
+/// Utility for recognizing words that are valid base words with common suffixes.
+///
+/// This helps avoid incorrect autocorrections for words like "cats" (cat + s),
+/// "boxes" (box + es), "running" (run + ning), etc. that may not be in the dictionary
+/// but are clearly valid derived forms.
+///
+/// Example usage:
+/// ```swift
+/// let settings = SymSpellConfiguration.SuffixSettings()
+/// let handler = SuffixHandler(settings: settings, isValidWord: symSpell.isValidWord)
+///
+/// handler.isValidWithSuffix("cats")     // → true (if "cat" is valid)
+/// handler.isValidWithSuffix("boxes")    // → true (if "box" is valid)
+/// handler.isValidWithSuffix("running")  // → true (if "run" is valid)
+/// handler.getBaseWord("cats")           // → "cat"
+/// ```
+public struct SuffixHandler {
+    public let settings: SymSpellConfiguration.SuffixSettings
+
+    /// Function to check if a word is valid in the dictionary
+    private let isValidWord: (String) -> Bool
+
+    /// Suffix patterns with their removal rules
+    /// Format: (suffix, baseTransformations) where baseTransformations are ways to get the base word
+    private static let suffixRules: [(suffix: String, categories: Set<SuffixCategory>, transforms: [SuffixTransform])] = [
+        // Possessive
+        ("'s", [.possessive], [.dropSuffix]),
+
+        // -ing forms (verb present participle)
+        ("ing", [.verb], [
+            .dropSuffix,                    // "going" → "go"
+            .dropSuffixAdd("e"),            // "making" → "make"
+            .dropSuffixDropDouble           // "running" → "run" (drop doubled consonant)
+        ]),
+
+        // -ed forms (verb past tense)
+        ("ed", [.verb], [
+            .dropSuffix,                    // "walked" → "walk"
+            .dropSuffixAdd("e"),            // "baked" → "bake"
+            .dropSuffixDropDouble           // "stopped" → "stop"
+        ]),
+
+        // -ies → -y (plural of words ending in consonant + y)
+        ("ies", [.plural], [.replaceSuffix("y")]),  // "babies" → "baby"
+
+        // -es forms (plural/verb for words ending in s, x, z, ch, sh)
+        ("es", [.plural, .verb], [
+            .dropSuffix,                    // "boxes" → "box", "watches" → "watch"
+        ]),
+
+        // -s forms (basic plural/verb third person)
+        ("s", [.plural, .verb], [.dropSuffix]),  // "cats" → "cat", "runs" → "run"
+
+        // -ly (adverbs)
+        ("ly", [.adverb], [
+            .dropSuffix,                    // "quickly" → "quick"
+            .replaceSuffix("le"),           // "simply" → "simple"
+            .replaceSuffix("y"),            // "happily" → "happy" (actually ily→y)
+        ]),
+
+        // -ily → -y (adverbs from adjectives ending in -y)
+        ("ily", [.adverb], [.replaceSuffix("y")]),  // "happily" → "happy"
+
+        // -er (comparative)
+        ("er", [.comparative], [
+            .dropSuffix,                    // "faster" → "fast"
+            .dropSuffixDropDouble,          // "bigger" → "big"
+            .dropSuffixAdd("e"),            // "nicer" → "nice"
+        ]),
+
+        // -est (superlative)
+        ("est", [.comparative], [
+            .dropSuffix,                    // "fastest" → "fast"
+            .dropSuffixDropDouble,          // "biggest" → "big"
+            .dropSuffixAdd("e"),            // "nicest" → "nice"
+        ]),
+
+        // -ier → -y (comparative of adjectives ending in -y)
+        ("ier", [.comparative], [.replaceSuffix("y")]),  // "happier" → "happy"
+
+        // -iest → -y (superlative of adjectives ending in -y)
+        ("iest", [.comparative], [.replaceSuffix("y")]),  // "happiest" → "happy"
+    ]
+
+    /// Categories of suffixes for filtering
+    public enum SuffixCategory {
+        case plural
+        case verb
+        case possessive
+        case adverb
+        case comparative
+    }
+
+    /// Transformation to apply to get base word
+    private enum SuffixTransform {
+        case dropSuffix                     // Just remove the suffix
+        case dropSuffixAdd(String)          // Remove suffix, add string (e.g., -ing → -e)
+        case dropSuffixDropDouble           // Remove suffix and doubled consonant
+        case replaceSuffix(String)          // Replace suffix with string
+    }
+
+    public init(settings: SymSpellConfiguration.SuffixSettings, isValidWord: @escaping (String) -> Bool) {
+        self.settings = settings
+        self.isValidWord = isValidWord
+    }
+
+    /// Check if a word is a valid base word with a recognized suffix.
+    ///
+    /// - Parameter word: The word to check
+    /// - Returns: true if the word appears to be baseWord + suffix where baseWord is valid
+    public func isValidWithSuffix(_ word: String) -> Bool {
+        guard settings.enabled else { return false }
+        return getBaseWord(word) != nil
+    }
+
+    /// Get the base word if this word is baseWord + suffix.
+    ///
+    /// - Parameter word: The word to analyze
+    /// - Returns: The base word if found, nil otherwise
+    public func getBaseWord(_ word: String) -> String? {
+        guard settings.enabled else { return nil }
+
+        let lowercased = word.lowercased()
+        guard lowercased.count >= 3 else { return nil }  // Too short for suffix analysis
+
+        for (suffix, categories, transforms) in Self.suffixRules {
+            // Check if this suffix category is enabled
+            if !isCategoryEnabled(categories) { continue }
+
+            // Check if word ends with this suffix
+            guard lowercased.hasSuffix(suffix) else { continue }
+
+            // Try each transformation to find a valid base
+            for transform in transforms {
+                if let base = applyTransform(to: lowercased, suffix: suffix, transform: transform) {
+                    if isValidWord(base) {
+                        return base
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Get suffix information for a word if it has a recognized suffix.
+    ///
+    /// - Parameter word: The word to analyze
+    /// - Returns: Tuple of (baseWord, suffix) if found, nil otherwise
+    public func analyzeSuffix(_ word: String) -> (base: String, suffix: String)? {
+        guard settings.enabled else { return nil }
+
+        let lowercased = word.lowercased()
+        guard lowercased.count >= 3 else { return nil }
+
+        for (suffix, categories, transforms) in Self.suffixRules {
+            if !isCategoryEnabled(categories) { continue }
+            guard lowercased.hasSuffix(suffix) else { continue }
+
+            for transform in transforms {
+                if let base = applyTransform(to: lowercased, suffix: suffix, transform: transform) {
+                    if isValidWord(base) {
+                        return (base, suffix)
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    // MARK: - Private Helpers
+
+    private func isCategoryEnabled(_ categories: Set<SuffixCategory>) -> Bool {
+        for category in categories {
+            switch category {
+            case .plural:
+                if settings.handlePlurals { return true }
+            case .verb:
+                if settings.handleVerbForms { return true }
+            case .possessive:
+                if settings.handlePossessives { return true }
+            case .adverb:
+                if settings.handleAdverbs { return true }
+            case .comparative:
+                if settings.handleComparatives { return true }
+            }
+        }
+        return false
+    }
+
+    private func applyTransform(to word: String, suffix: String, transform: SuffixTransform) -> String? {
+        let withoutSuffix = String(word.dropLast(suffix.count))
+        guard !withoutSuffix.isEmpty else { return nil }
+
+        switch transform {
+        case .dropSuffix:
+            return withoutSuffix
+
+        case .dropSuffixAdd(let addition):
+            return withoutSuffix + addition
+
+        case .dropSuffixDropDouble:
+            // Check if last two chars are doubled consonant
+            guard withoutSuffix.count >= 2 else { return nil }
+            let chars = Array(withoutSuffix)
+            let last = chars[chars.count - 1]
+            let secondLast = chars[chars.count - 2]
+            if last == secondLast && isConsonant(last) {
+                return String(withoutSuffix.dropLast())
+            }
+            return nil
+
+        case .replaceSuffix(let replacement):
+            return withoutSuffix + replacement
+        }
+    }
+
+    private func isConsonant(_ char: Character) -> Bool {
+        let vowels: Set<Character> = ["a", "e", "i", "o", "u"]
+        return char.isLetter && !vowels.contains(char.lowercased().first ?? " ")
     }
 }

@@ -468,7 +468,58 @@ extension LowMemorySymSpell {
 
 ---
 
-## 6. Future Considerations
+## 6. Grammar-Aware Contraction Handling (Future)
+
+**Problem:**
+Simple contraction mapping incorrectly converts valid words to contractions:
+- "well" → "we'll" (but "well" is a common word: "I'm doing well")
+- "were" → "we're" (but "were" is past tense: "they were here")
+- "ill" → "I'll" (but "ill" means sick: "feeling ill")
+- "its" → "it's" (but "its" is possessive: "the dog wagged its tail")
+
+**Current Workaround:**
+These ambiguous words are excluded from the contraction map entirely, meaning:
+- "well" stays as "well" (correct for "doing well", but user must manually type "we'll")
+- "were" stays as "were" (correct for past tense, but "we're" requires manual entry)
+
+**Ideal Solution:**
+Use grammatical context to determine the correct interpretation:
+
+```
+"we well go" → "we'll go" (verb context: "we" + verb suggests contraction)
+"doing well" → "doing well" (adverb context: "doing" + adverb keeps "well")
+
+"we were there" → "we were there" (past tense context preserved)
+"we were going" → "we're going" (present progressive suggests contraction)
+
+"its tail" → "its tail" (possessive: followed by noun)
+"its raining" → "it's raining" (contraction: followed by verb)
+```
+
+**Implementation Approaches:**
+
+1. **Part-of-speech tagging (complex):**
+   - Requires POS tagger or simple grammar rules
+   - Look at surrounding words to determine context
+   - High accuracy but significant complexity
+
+2. **Bigram-based heuristics (simpler):**
+   - Use bigram frequencies to decide
+   - "its tail" vs "it's raining" - check which bigram is more common
+   - Less accurate but leverages existing bigram infrastructure
+
+3. **Pattern matching (simplest):**
+   - "its" + noun → keep "its"
+   - "its" + verb/adjective → suggest "it's"
+   - Requires basic word classification
+
+**Current Status:** Not implemented. Ambiguous words excluded from contraction map as a safe default.
+
+**Priority:** Medium - improves UX but requires grammar awareness beyond current spell-check scope.
+
+---
+
+## 7. Future Considerations
 
 ### Confidence Score API
 Expose confidence calculations directly from the library:
@@ -502,7 +553,8 @@ Optional phonetic similarity for suggestions:
 2. ✅ **DONE**: Spatial Keyboard Weighting - Significant UX improvement for typos
 3. ✅ **DONE**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
 4. ✅ **DONE**: Improved Frequency Weighting - Common words rank higher, bigram context support
-5. **Medium**: Auto-Apply Correction on Send - Better UX for messaging apps
-6. **Medium**: Confidence Score API - Cleaner integration
-7. **Low**: Custom Dictionary Tiers - Nice to have
-8. **Low**: Phonetic Matching - Complex implementation
+5. **Medium**: Grammar-Aware Contraction Handling - Distinguish "well"/"we'll", "its"/"it's" by context
+6. **Medium**: Auto-Apply Correction on Send - Better UX for messaging apps
+7. **Medium**: Confidence Score API - Cleaner integration
+8. **Low**: Custom Dictionary Tiers - Nice to have
+9. **Low**: Phonetic Matching - Complex implementation
