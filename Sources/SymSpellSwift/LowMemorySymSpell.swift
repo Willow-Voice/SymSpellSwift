@@ -107,6 +107,130 @@ public enum LowMemoryVerbosity {
     case all
 }
 
+// MARK: - RankingMode
+
+/// Controls how suggestions are ranked/sorted.
+///
+/// By default, SymSpell ranks by edit distance first, using frequency only as a tiebreaker.
+/// This can cause rare words at distance 1 to rank higher than very common words at distance 2.
+///
+/// **Example with `.distanceFirst` (default):**
+/// ```
+/// Input: "teh"
+/// 1. "te" (distance 1, freq: 500)      <- rare word ranks first
+/// 2. "the" (distance 2, freq: 5000000) <- common word ranks lower
+/// ```
+///
+/// **Example with `.balanced`:**
+/// ```
+/// Input: "teh"
+/// 1. "the" (distance 2, freq: 5000000) <- common word now ranks first
+/// 2. "te" (distance 1, freq: 500)
+/// ```
+public enum RankingMode {
+    /// Default SymSpell behavior: distance is primary sort, frequency is tiebreaker only.
+    /// Use this for traditional spell checking where closest match is preferred.
+    case distanceFirst
+
+    /// Balanced scoring that weighs both distance and frequency.
+    /// Common words can outrank rare words even with slightly higher edit distance.
+    /// Recommended for keyboard auto-correction where common words are more likely intended.
+    case balanced
+
+    /// Aggressive frequency weighting that strongly favors common words.
+    /// Use this when the input is likely a common word with multiple typos.
+    case frequencyBoosted
+}
+
+// MARK: - SuggestionScorer
+
+/// Calculates combined scores for ranking suggestions.
+///
+/// Supports three ranking modes:
+/// - `.distanceFirst`: Traditional SymSpell behavior (distance primary, frequency tiebreaker)
+/// - `.balanced`: Weighs both distance and frequency (common words can outrank closer rare words)
+/// - `.frequencyBoosted`: Strongly favors common words
+///
+/// Additionally supports bigram context: if a previous word is provided, suggestions that
+/// commonly follow that word get a score boost.
+struct SuggestionScorer {
+    let maxEditDistance: Int
+    let maxFrequency: Int
+    let maxBigramFrequency: Int
+    let mode: RankingMode
+
+    init(maxEditDistance: Int, maxFrequency: Int, maxBigramFrequency: Int = 0, mode: RankingMode) {
+        self.maxEditDistance = maxEditDistance
+        self.maxFrequency = maxFrequency
+        self.maxBigramFrequency = maxBigramFrequency
+        self.mode = mode
+    }
+
+    /// Calculate a combined score for a suggestion (higher is better).
+    ///
+    /// - Parameters:
+    ///   - distance: Edit distance from input
+    ///   - frequency: Word frequency from dictionary
+    ///   - bigramFrequency: Bigram frequency with previous word (0 if no context)
+    /// - Returns: Combined score (higher = better ranking)
+    func score(distance: Int, frequency: Int, bigramFrequency: Int = 0) -> Double {
+        switch mode {
+        case .distanceFirst:
+            // Traditional: distance primary, frequency secondary (as tiebreaker)
+            // Bigram context adds a bonus to the frequency score
+            let distanceScore = Double(maxEditDistance + 1 - distance) * 1_000_000_000.0
+            var freqScore = Double(frequency)
+
+            // Bigram bonus: if this word commonly follows the previous word, boost it
+            if bigramFrequency > 0 {
+                freqScore += Double(bigramFrequency) * 10.0
+            }
+
+            return distanceScore + freqScore
+
+        case .balanced:
+            // Balanced: combine distance, frequency, and bigram context
+            let normalizedFreq = maxFrequency > 0
+                ? log10(Double(frequency) + 1) / log10(Double(maxFrequency) + 1)
+                : 0.0
+
+            let distancePenalty = Double(distance) / Double(max(1, maxEditDistance))
+
+            // Bigram bonus (0 to 0.2 additional score)
+            var bigramBonus = 0.0
+            if bigramFrequency > 0 && maxBigramFrequency > 0 {
+                let normalizedBigram = log10(Double(bigramFrequency) + 1) / log10(Double(maxBigramFrequency) + 1)
+                bigramBonus = normalizedBigram * 0.2
+            }
+
+            // Combined score: 50% distance, 30% frequency, 20% bigram
+            let distanceWeight = 0.5
+            let frequencyWeight = 0.3
+            return (1.0 - distancePenalty) * distanceWeight + normalizedFreq * frequencyWeight + bigramBonus
+
+        case .frequencyBoosted:
+            // Aggressive frequency boosting with bigram context
+            let normalizedFreq = maxFrequency > 0
+                ? log10(Double(frequency) + 1) / log10(Double(maxFrequency) + 1)
+                : 0.0
+
+            let distancePenalty = Double(distance) / Double(max(1, maxEditDistance))
+
+            // Stronger bigram bonus (0 to 0.3)
+            var bigramBonus = 0.0
+            if bigramFrequency > 0 && maxBigramFrequency > 0 {
+                let normalizedBigram = log10(Double(bigramFrequency) + 1) / log10(Double(maxBigramFrequency) + 1)
+                bigramBonus = normalizedBigram * 0.3
+            }
+
+            // Combined: 30% distance, 40% frequency, 30% bigram
+            let distanceWeight = 0.3
+            let frequencyWeight = 0.4
+            return (1.0 - distancePenalty) * distanceWeight + normalizedFreq * frequencyWeight + bigramBonus
+        }
+    }
+}
+
 // MARK: - MMapDictionary
 
 /// Memory-mapped dictionary for word frequencies.
@@ -306,6 +430,34 @@ public class MMapDictionary {
     /// Check if word exists in dictionary
     public func contains(_ word: String) -> Bool {
         return get(word) > 0
+    }
+
+    /// Estimate the maximum word frequency in the dictionary.
+    ///
+    /// Samples common English words and returns the highest frequency found.
+    /// This is used for normalizing frequency scores in ranking.
+    func estimateMaxFrequency() -> Int {
+        // Sample common English words that typically have highest frequencies
+        let commonWords = ["the", "of", "and", "a", "to", "in", "is", "you", "that", "it"]
+        var maxFreq = 0
+
+        for word in commonWords {
+            let freq = get(word)
+            if freq > maxFreq {
+                maxFreq = freq
+            }
+        }
+
+        // If no common words found, scan first 100 entries
+        if maxFreq == 0 {
+            for i in 0..<min(100, numWords) {
+                if let (_, count) = getWordAtIndex(i) {
+                    maxFreq = max(maxFreq, count)
+                }
+            }
+        }
+
+        return maxFreq
     }
 
     /// Find the range of indices for words starting with the given prefix.
@@ -605,6 +757,8 @@ public class LowMemorySymSpell {
     public let prefixLength: Int
     /// Keyboard layout for spatial error weighting
     public let keyboardLayout: KeyboardLayout
+    /// Ranking mode for sorting suggestions
+    public let rankingMode: RankingMode
 
     // Data directory
     private let dataDir: URL
@@ -626,6 +780,10 @@ public class LowMemorySymSpell {
     // Statistics
     public private(set) var wordCount: Int = 0
     public private(set) var bigramCount: Int = 0
+    /// Maximum word frequency in dictionary (for ranking normalization)
+    public private(set) var maxFrequency: Int = 0
+    /// Maximum bigram frequency (for ranking normalization)
+    public private(set) var maxBigramFrequency: Int = 0
 
     /// Create a new LowMemorySymSpell instance.
     ///
@@ -633,16 +791,19 @@ public class LowMemorySymSpell {
     ///   - maxEditDistance: Maximum edit distance for lookups (default: 2)
     ///   - prefixLength: Length of word prefixes for spell checking (default: 7)
     ///   - keyboardLayout: Keyboard layout for spatial error weighting (default: .none)
+    ///   - rankingMode: How to rank suggestions - `.distanceFirst` (default), `.balanced`, or `.frequencyBoosted`
     ///   - dataDir: Directory for mmap files. If nil, uses a temporary directory.
     public init(
         maxEditDistance: Int = 2,
         prefixLength: Int = 7,
         keyboardLayout: KeyboardLayout = .none,
+        rankingMode: RankingMode = .distanceFirst,
         dataDir: URL? = nil
     ) {
         self.maxEditDistance = maxEditDistance
         self.prefixLength = prefixLength
         self.keyboardLayout = keyboardLayout
+        self.rankingMode = rankingMode
 
         if let dataDir = dataDir {
             self.dataDir = dataDir
@@ -724,6 +885,9 @@ public class LowMemorySymSpell {
 
         wordCount = prebuiltWords.numWords
 
+        // Estimate max frequency for ranking normalization
+        maxFrequency = prebuiltWords.estimateMaxFrequency()
+
         // Bigrams are optional
         if FileManager.default.fileExists(atPath: bigramsFile.path) {
             let bigramsDict = MMapDictionary(filePath: bigramsFile)
@@ -731,6 +895,7 @@ public class LowMemorySymSpell {
                 _prebuiltBigramsPath = bigramsFile
                 _prebuiltBigrams = bigramsDict
                 bigramCount = bigramsDict.numWords
+                maxBigramFrequency = bigramsDict.estimateMaxFrequency()
             }
         }
 
@@ -886,6 +1051,9 @@ public class LowMemorySymSpell {
             bigramsList.append((key, count))
         }
 
+        // Track max bigram frequency for ranking normalization
+        maxBigramFrequency = bigramsList.map { $0.1 }.max() ?? 0
+
         do {
             try bigrams.build(words: bigramsList)
             bigrams.open()
@@ -940,6 +1108,9 @@ public class LowMemorySymSpell {
     private func buildFromWordsList(_ wordsList: [(String, Int)]) -> Bool {
         // Sort alphabetically for binary search
         let sortedWords = wordsList.sorted { $0.0 < $1.0 }
+
+        // Track max frequency for ranking normalization
+        maxFrequency = sortedWords.map { $0.1 }.max() ?? 0
 
         // Build words mmap
         do {
@@ -1010,13 +1181,27 @@ public class LowMemorySymSpell {
     ///   - maxEditDistance: Maximum edit distance (defaults to instance maxEditDistance)
     ///   - includeUnknown: If true, include the input term in results even if not found
     ///   - transferCasing: If true, preserve the user's original casing in suggestions
+    ///   - previousWord: Previous word for bigram context (boosts words that commonly follow it)
     /// - Returns: Array of SuggestItem representing suggested corrections
+    ///
+    /// **Ranking Modes:**
+    /// - `.distanceFirst` (default): Traditional SymSpell - closest edit distance wins
+    /// - `.balanced`: Weighs distance + frequency + bigram context together
+    /// - `.frequencyBoosted`: Strongly favors common words and bigram matches
+    ///
+    /// **Example with context:**
+    /// ```swift
+    /// // "th" after "the" is likely "the" (bigram "the the" is rare but "the quick" is common)
+    /// let suggestions = spellChecker.lookup(phrase: "qick", verbosity: .closest, previousWord: "the")
+    /// // Returns "quick" ranked higher due to "the quick" bigram
+    /// ```
     public func lookup(
         phrase: String,
         verbosity: LowMemoryVerbosity,
         maxEditDistance: Int? = nil,
         includeUnknown: Bool = false,
-        transferCasing: Bool = false
+        transferCasing: Bool = false,
+        previousWord: String? = nil
     ) -> [SuggestItem] {
         let maxDist = min(maxEditDistance ?? self.maxEditDistance, self.maxEditDistance)
         var suggestions: [SuggestItem] = []
@@ -1147,7 +1332,35 @@ public class LowMemorySymSpell {
         }
 
         if suggestions.count > 1 {
-            suggestions.sort()
+            // Apply custom ranking based on rankingMode
+            if rankingMode == .distanceFirst && previousWord == nil {
+                // Traditional SymSpell sorting
+                suggestions.sort()
+            } else {
+                // Use scorer for balanced/frequencyBoosted modes or when context is provided
+                let scorer = SuggestionScorer(
+                    maxEditDistance: maxDist,
+                    maxFrequency: maxFrequency,
+                    maxBigramFrequency: maxBigramFrequency,
+                    mode: rankingMode
+                )
+
+                // Calculate scores with bigram context
+                let prevWord = previousWord?.lowercased()
+                var scoredSuggestions: [(item: SuggestItem, score: Double)] = suggestions.map { item in
+                    var bigramFreq = 0
+                    if let prev = prevWord {
+                        let bigram = "\(prev) \(item.term.lowercased())"
+                        bigramFreq = activeBigrams.get(bigram)
+                    }
+                    let score = scorer.score(distance: item.distance, frequency: item.count, bigramFrequency: bigramFreq)
+                    return (item, score)
+                }
+
+                // Sort by score (descending)
+                scoredSuggestions.sort { $0.score > $1.score }
+                suggestions = scoredSuggestions.map { $0.item }
+            }
         }
 
         if includeUnknown && suggestions.isEmpty {
@@ -1906,8 +2119,14 @@ public protocol KeyboardSpellChecker {
     /// Get spelling suggestions for a word
     func suggestions(for word: String, limit: Int) -> [SuggestItem]
 
+    /// Get spelling suggestions with context (previous word for bigram ranking)
+    func suggestions(for word: String, limit: Int, previousWord: String?) -> [SuggestItem]
+
     /// Get auto-correction for a word (returns nil if word is correct)
     func autoCorrection(for word: String) -> String?
+
+    /// Get auto-correction with context (previous word for bigram ranking)
+    func autoCorrection(for word: String, previousWord: String?) -> String?
 
     /// Check if word is valid
     func isValidWord(_ word: String) -> Bool
@@ -1916,7 +2135,26 @@ public protocol KeyboardSpellChecker {
 extension LowMemorySymSpell: KeyboardSpellChecker {
     /// Get spelling suggestions for a word
     public func suggestions(for word: String, limit: Int = 5) -> [SuggestItem] {
-        return Array(lookup(phrase: word, verbosity: .closest, maxEditDistance: maxEditDistance).prefix(limit))
+        return suggestions(for: word, limit: limit, previousWord: nil)
+    }
+
+    /// Get spelling suggestions with context (previous word for bigram ranking)
+    ///
+    /// When `previousWord` is provided and bigrams are loaded, suggestions that commonly
+    /// follow the previous word are ranked higher.
+    ///
+    /// **Example:**
+    /// ```swift
+    /// // After "the", "quick" is more likely than "quack"
+    /// let suggestions = spellChecker.suggestions(for: "qick", limit: 5, previousWord: "the")
+    /// ```
+    public func suggestions(for word: String, limit: Int = 5, previousWord: String?) -> [SuggestItem] {
+        return Array(lookup(
+            phrase: word,
+            verbosity: .closest,
+            maxEditDistance: maxEditDistance,
+            previousWord: previousWord
+        ).prefix(limit))
     }
 
     /// Get auto-correction for a word.
@@ -1930,11 +2168,24 @@ extension LowMemorySymSpell: KeyboardSpellChecker {
     /// - Parameter word: The word to check
     /// - Returns: The correction if confident, nil otherwise
     public func autoCorrection(for word: String) -> String? {
+        return autoCorrection(for: word, previousWord: nil)
+    }
+
+    /// Get auto-correction with context (previous word for bigram ranking).
+    ///
+    /// When `previousWord` is provided and bigrams are loaded, corrections that commonly
+    /// follow the previous word get a confidence boost.
+    ///
+    /// - Parameters:
+    ///   - word: The word to check
+    ///   - previousWord: Previous word for bigram context
+    /// - Returns: The correction if confident, nil otherwise
+    public func autoCorrection(for word: String, previousWord: String?) -> String? {
         let lowercaseWord = word.lowercased()
         let wordFrequency = getWordFrequency(lowercaseWord)
         let isValid = wordFrequency > 0
 
-        let suggestions = lookup(phrase: lowercaseWord, verbosity: .all, maxEditDistance: maxEditDistance)
+        let suggestions = lookup(phrase: lowercaseWord, verbosity: .all, maxEditDistance: maxEditDistance, previousWord: previousWord)
 
         guard let top = suggestions.first else {
             return nil  // No suggestions found

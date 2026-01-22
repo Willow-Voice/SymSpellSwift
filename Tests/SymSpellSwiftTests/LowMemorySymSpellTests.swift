@@ -848,4 +848,183 @@ final class LowMemorySymSpellTests: XCTestCase {
         // Print for visibility
         print("SymSpellSwift Version: \(version)")
     }
+
+    // MARK: - Ranking Mode Tests
+
+    func testRankingModeDistanceFirst() throws {
+        // Default mode: distance is primary, frequency is tiebreaker
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .distanceFirst,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        cat 500
+        car 200
+        carrot 5000000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // "cay" -> distance 1: "cat" (y->t), "car" (y->r); distance 2: "carrot"
+        // With distanceFirst, "cat" and "car" (distance 1) should rank before "carrot" (distance 2)
+        let suggestions = spellChecker.lookup(phrase: "cay", verbosity: .all)
+        XCTAssertGreaterThanOrEqual(suggestions.count, 2)
+
+        // First suggestion should be distance 1
+        XCTAssertEqual(suggestions[0].distance, 1)
+        // "cat" should beat "car" as tiebreaker due to higher frequency
+        XCTAssertEqual(suggestions[0].term, "cat")
+
+        spellChecker.close()
+    }
+
+    func testRankingModeBalanced() throws {
+        // Balanced mode: at same distance, frequency determines ranking
+        // (vs distanceFirst which would use count as simple tiebreaker)
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .balanced,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        // All distance 1 from "helo": "hello", "help", "held"
+        let dictContent = """
+        hello 5000000
+        help 100000
+        held 50000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        // "helo" -> all are distance 1
+        // With balanced mode, "hello" (highest frequency) should rank first
+        let suggestions = spellChecker.lookup(phrase: "helo", verbosity: .all)
+        XCTAssertGreaterThanOrEqual(suggestions.count, 2)
+
+        // First should be "hello" due to highest frequency at same distance
+        XCTAssertEqual(suggestions[0].term, "hello", "Highest frequency should rank first in balanced mode")
+
+        // Verify frequency ordering
+        if suggestions.count >= 3 {
+            XCTAssertGreaterThan(suggestions[0].count, suggestions[1].count)
+            XCTAssertGreaterThan(suggestions[1].count, suggestions[2].count)
+        }
+
+        spellChecker.close()
+    }
+
+    func testRankingModeFrequencyBoosted() throws {
+        // Frequency boosted mode: strongly favors common words even across distances
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .frequencyBoosted,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        // "helo" -> "help" (d=1), "hello" (d=1), "held" (d=1)
+        let dictContent = """
+        hello 5000000
+        help 100000
+        held 50000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+
+        let suggestions = spellChecker.lookup(phrase: "helo", verbosity: .all)
+        XCTAssertGreaterThanOrEqual(suggestions.count, 2)
+
+        // With frequency boosted mode, "hello" (very high frequency) should rank first
+        XCTAssertEqual(suggestions[0].term, "hello", "High-frequency word should rank first in frequency boosted mode")
+
+        spellChecker.close()
+    }
+
+    func testBigramContextRanking() throws {
+        // Test that bigram context influences ranking
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .balanced,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        quick 100000
+        quack 80000
+        the 5000000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        the quick 1000000
+        the quack 1000
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
+
+        // Without context: "quic" -> both "quick" and "quack" are distance 1
+        // "quick" has higher unigram frequency so it should win
+        let suggestionsNoContext = spellChecker.lookup(phrase: "quic", verbosity: .closest)
+        XCTAssertFalse(suggestionsNoContext.isEmpty)
+        XCTAssertEqual(suggestionsNoContext[0].term, "quick")
+
+        // With context "the": "the quick" bigram is much more common than "the quack"
+        // So "quick" should be even more strongly preferred
+        let suggestionsWithContext = spellChecker.lookup(
+            phrase: "quic",
+            verbosity: .closest,
+            previousWord: "the"
+        )
+        XCTAssertFalse(suggestionsWithContext.isEmpty)
+        XCTAssertEqual(suggestionsWithContext[0].term, "quick", "Bigram context should boost 'quick' after 'the'")
+
+        spellChecker.close()
+    }
+
+    func testSuggestionsWithContext() throws {
+        // Test the convenience method with context
+        let spellChecker = LowMemorySymSpell(
+            maxEditDistance: 2,
+            prefixLength: 7,
+            rankingMode: .balanced,
+            dataDir: tempDir
+        )
+
+        let dictPath = tempDir.appendingPathComponent("dict.txt")
+        let dictContent = """
+        world 100000
+        word 90000
+        hello 200000
+        """
+        try dictContent.write(to: dictPath, atomically: true, encoding: .utf8)
+
+        let bigramPath = tempDir.appendingPathComponent("bigrams.txt")
+        let bigramContent = """
+        hello world 500000
+        hello word 1000
+        """
+        try bigramContent.write(to: bigramPath, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(spellChecker.loadDictionary(corpus: dictPath))
+        XCTAssertTrue(spellChecker.loadBigramDictionary(corpus: bigramPath))
+
+        // Test suggestions method with previousWord
+        let suggestions = spellChecker.suggestions(for: "worl", limit: 5, previousWord: "hello")
+        XCTAssertFalse(suggestions.isEmpty)
+        XCTAssertEqual(suggestions[0].term, "world", "After 'hello', 'world' should rank higher than 'word'")
+
+        spellChecker.close()
+    }
 }

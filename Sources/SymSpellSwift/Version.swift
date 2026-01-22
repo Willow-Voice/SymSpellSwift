@@ -22,7 +22,7 @@ public struct SymSpellSwiftVersion {
     public static let major = 1
 
     /// Minor version number (new features, backward compatible)
-    public static let minor = 1
+    public static let minor = 2
 
     /// Patch version number (bug fixes)
     public static let patch = 0
@@ -51,6 +51,7 @@ public struct SymSpellSwiftVersion {
         SymSpellSwift v\(current)
         - Keyboard layouts: QWERTY, AZERTY, QWERTZ, Dvorak, Colemak
         - Features: Spell checking, Word segmentation (beam search), Compound correction
+        - Ranking modes: distanceFirst, balanced, frequencyBoosted (with bigram context)
         - Memory mode: Low-memory (mmap) and Standard (in-memory)
         """
     }

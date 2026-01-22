@@ -256,14 +256,14 @@ Result: "the" with weighted distance 0.5 (r→e adjacent)
 
 ---
 
-## 4. Improved Frequency Weighting in Ranking (Future)
+## 4. Improved Frequency Weighting in Ranking ✅ IMPLEMENTED
 
 **Problem:**
-Currently, SymSpell ranks suggestions by:
+Originally, SymSpell ranked suggestions by:
 1. Edit distance (primary sort)
 2. Frequency (secondary sort - only as tiebreaker within same distance)
 
-This means a rare word with distance 1 always ranks higher than a common word with distance 2, even when the common word is much more likely to be correct.
+This meant a rare word with distance 1 always ranked higher than a common word with distance 2, even when the common word was much more likely to be correct.
 
 **Example:**
 ```
@@ -501,7 +501,7 @@ Optional phonetic similarity for suggestions:
 1. ✅ **DONE**: Word Segmentation Bigram Validation - Prevents incorrect segmentations
 2. ✅ **DONE**: Spatial Keyboard Weighting - Significant UX improvement for typos
 3. ✅ **DONE**: Correction-Aware Segmentation (Beam Search) - Handle misspelled concatenated words
-4. **Medium**: Improved Frequency Weighting - Common words should rank higher
+4. ✅ **DONE**: Improved Frequency Weighting - Common words rank higher, bigram context support
 5. **Medium**: Auto-Apply Correction on Send - Better UX for messaging apps
 6. **Medium**: Confidence Score API - Cleaner integration
 7. **Low**: Custom Dictionary Tiers - Nice to have
