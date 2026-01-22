@@ -22,7 +22,7 @@ public struct SymSpellSwiftVersion {
     public static let major = 1
 
     /// Minor version number (new features, backward compatible)
-    public static let minor = 3
+    public static let minor = 4
 
     /// Patch version number (bug fixes)
     public static let patch = 0
